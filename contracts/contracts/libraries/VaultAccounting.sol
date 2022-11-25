@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: ISC
-pragma solidity ^0.8.10;
+pragma solidity ^0.8.17;
 
 struct Vault {
     uint128 amount;
