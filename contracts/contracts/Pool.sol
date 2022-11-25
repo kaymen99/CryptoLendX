@@ -2,13 +2,18 @@
 
 pragma solidity 0.8.17;
 
+import "@openzeppelin/contracts/access/Ownable.sol";
 import "./libraries/VaultAccounting.sol";
 import "./utils/PriceConverter.sol";
 
-contract Pool is PriceConverter {
+contract Pool is PriceConverter, Ownable {
     using VaultAccountingLibrary for Vault;
 
+    //--------------------------------------------------------------------
+    /** VARIABLES */
+
     uint256 public constant LIQUIDATION_THRESHOLD = 80; // 80%
+    uint256 public constant LIQUIDATION_CLOSE_FACTOR = 50; // 50%
     uint256 public constant LIQUIDATION_REWARD = 5; // 5%
     uint256 public constant MIN_HEALTH_FACTOR = 1e18;
 
@@ -17,25 +22,54 @@ contract Pool is PriceConverter {
         bool supported;
     }
 
-    mapping(address => SupportedERC20) supportedTokens;
-    address[] public supportedTokensList;
-
     struct TokenVault {
         Vault totalAsset;
         Vault totalBorrow;
     }
+
+    address[] public supportedTokensList;
+    mapping(address => SupportedERC20) supportedTokens;
+
+    mapping(address => TokenVault) vaults;
+
+    mapping(address => mapping(address => uint256))
+        public userCollateralBalance;
+    mapping(address => mapping(address => uint256)) public userBorrowBalance;
+
+    //--------------------------------------------------------------------
+    /** MODIFIERS */
 
     modifier allowedToken(address token) {
         if (!supportedTokens[token].supported) revert TokenNotSupported();
         _;
     }
 
-    mapping(address => TokenVault) vaults;
+    //--------------------------------------------------------------------
+    /** ERRORS */
 
-    mapping(address => mapping(address => uint256))
-        public userCollateralBalance;
+    error TokenNotSupported();
+    error BorrowNotAllowed();
+    error InsufficientBalance();
+    error UnderCollateralized();
+    error BorrowerIsSolvant();
+    error AlreadySupported(address token);
+    error TransferFailed();
 
-    mapping(address => mapping(address => uint256)) public userBorrowBalance;
+    //--------------------------------------------------------------------
+    /** EVENTS */
+
+    event Deposit(address user, address token, uint256 amount, uint256 shares);
+    event Borrow(address user, address token, uint256 amount, uint256 shares);
+    event Repay(address user, address token, uint256 amount, uint256 shares);
+    event Withdraw(address user, address token, uint256 amount, uint256 shares);
+    event Liquidated(address user, address liquidator);
+    event AddSupportedToken(address token);
+
+    //--------------------------------------------------------------------
+    /** CONSTRUCTOR */
+
+    //--------------------------------------------------------------------
+    /** FUNCTIONS */
 
     function supply(address token, uint256 amount)
         external
@@ -122,52 +156,25 @@ contract Pool is PriceConverter {
         vaults[_token] = _vault;
 
         if (healthFactor(msg.sender) <= MIN_HEALTH_FACTOR)
-            revert UnderCollateral();
+            revert UnderCollateralized();
 
-        emit Deposit(msg.sender, token, amount, shares);
+        emit Withdraw(msg.sender, token, amount, shares);
     }
 
     function liquidate(address user) external {
-        if (healthFactor(user) > MIN_HEALTH_FACTOR) revert BorrowerSolvant();
+        if (healthFactor(user) > MIN_HEALTH_FACTOR) revert BorrowerIsSolvant();
 
-        uint256 len = supportedTokensList.length;
-        for (uint256 i; i < len; ) {
-            address token = supportedTokensList[i];
-            uint256 amount = userCollateralBalance[user][token];
+        uint256 totalBorrowAmount = getUserTotalBorrow(user);
 
-            uint256 liquidationReward = (amount * LIQUIDATION_REWARD) / 100;
+        uint256 liquidationAmount = (totalBorrowAmount *
+            LIQUIDATION_CLOSE_FACTOR) / 100;
 
-            bool success = IERC20(token).transfer(
-                msg.sender,
-                liquidationReward
-            );
-            if (!success) revert TransferFailed();
+        uint256 liquidationReward = (liquidationAmount * LIQUIDATION_REWARD) /
+            100;
+            
+        // TODO : repay half user's debt with multiple ERC20 tokens and pay liquidator liquidation reward
 
-            TokenVault memory _vault = vaults[token];
-
-            uint256 assetShares = _vault.totalAsset.toShares(
-                _vault,
-                amount,
-                false
-            );
-            _vault.totalAsset.shares -= assetShares;
-
-            uint256 borrowShares = _vault.totalBorrow.toShares(
-                _vault,
-                amount,
-                false
-            );
-            _vault.totalBorrow.shares -= borrowShares;
-            _vault.totalBorrow.amount -= amount;
-
-            userCollateralBalance[msg.sender][token] = 0;
-            userCollateralBalance[msg.sender][token] = 0;
-            vaults[_token] = _vault;
-
-            unchecked {
-                ++i;
-            }
-        }
+        emit Liquidated(user, msg.sender);
     }
 
     function getUserTotalCollateral(address user)
@@ -235,5 +242,28 @@ contract Pool is PriceConverter {
         uint256 collateralAmountWithThreshold = (collateralAmount *
             LIQUIDATION_THRESHOLD) / 100;
         factor = (collateralAmountWithThreshold * 1e18) / totalBorrowAmount;
+    }
+
+    //--------------------------------------------------------------------
+    /** OWNER FUNCTIONS */
+
+    function addSupportedToken(address token, address priceFeed)
+        external
+        onlyOwner
+    {
+        uint256 len = supportedTokensList.length;
+        for (uint256 i; i < len; ) {
+            if (token == supportedTokensList[i]) {
+                revert AlreadySupported(token);
+            }
+            unchecked {
+                ++i;
+            }
+        }
+
+        supportedTokens[token] = SupportedERC20(priceFeed, true);
+        supportedTokensList.push(token);
+
+        emit AddSupportedToken(token);
     }
 }
