@@ -2,10 +2,10 @@
   "name": "smart_contracts",
   "version": "1.0.0",
   "main": "index.js",
-  "author": "Aymen1001",
+  "author": "kaymen99",
   "license": "MIT",
   "scripts": {
-    "deploy": "npx hardhat run scripts/deploy-vault.js",
+    "deploy": "",
     "test": "npx hardhat test"
   },
   "dependencies": {
