@@ -84,11 +84,11 @@ contract Pool is PriceConverter, Ownable {
         );
         if (!success) revert TransferFailed();
 
-        uint256 shares = _vault.totalAsset.toShares(_vault, amount, false);
+        uint256 shares = _vault.totalAsset.toShares(amount, false);
         _vault.totalAsset.shares += shares;
         _vault.totalAsset.amount += amount;
 
-        userCollateralBalance[msg.sender][token] += amount;
+        userCollateralBalance[msg.sender][token] += shares;
         vaults[_token] = _vault;
 
         emit Deposit(msg.sender, token, amount, shares);
@@ -103,7 +103,7 @@ contract Pool is PriceConverter, Ownable {
         bool success = IERC20(token).transfer(msg.sender, amount);
         if (!success) revert TransferFailed();
 
-        uint256 shares = _vault.totalBorrow.toShares(_vault, amount, false);
+        uint256 shares = _vault.totalBorrow.toShares(amount, false);
         _vault.totalBorrow.shares += shares;
         _vault.totalBorrow.amount += amount;
 
@@ -142,17 +142,17 @@ contract Pool is PriceConverter, Ownable {
     {
         TokenVault memory _vault = vaults[_token];
 
-        if (userCollateralBalance[msg.sender][token] < amount)
+        uint256 shares = _vault.totalAsset.toShares(amount, false);
+        if (userCollateralBalance[msg.sender][token] < shares)
             revert InsufficientBalance();
 
         bool success = IERC20(token).transfer(msg.sender, amount);
         if (!success) revert TransferFailed();
 
-        uint256 shares = _vault.totalAsset.toShares(_vault, amount, false);
         _vault.totalAsset.shares -= shares;
         _vault.totalAsset.amount -= amount;
 
-        userCollateralBalance[msg.sender][token] -= amount;
+        userCollateralBalance[msg.sender][token] -= shares;
         vaults[_token] = _vault;
 
         if (healthFactor(msg.sender) <= MIN_HEALTH_FACTOR)
@@ -162,17 +162,93 @@ contract Pool is PriceConverter, Ownable {
     }
 
     function liquidate(address user) external {
-        if (healthFactor(user) > MIN_HEALTH_FACTOR) revert BorrowerIsSolvant();
+        if (healthFactor(user) >= MIN_HEALTH_FACTOR) revert BorrowerIsSolvant();
 
-        uint256 totalBorrowAmount = getUserTotalBorrow(user);
+        uint256 userTotalBorrowAmountDAI = getUserTotalBorrow(user);
 
-        uint256 liquidationAmount = (totalBorrowAmount *
+        uint256 totalLiquidationAmountDAI = (userTotalBorrowAmount *
             LIQUIDATION_CLOSE_FACTOR) / 100;
+        uint256 userRepaidBorrowInDAI = totalLiquidationAmountDAI;
 
-        uint256 liquidationReward = (liquidationAmount * LIQUIDATION_REWARD) /
-            100;
-            
-        // TODO : repay half user's debt with multiple ERC20 tokens and pay liquidator liquidation reward
+        uint256 liquidationRewardDAI = (userTotalBorrowAmount *
+            LIQUIDATION_REWARD) / 100;
+
+        uint256 len = supportedTokensList.length;
+        for (uint256 i; i < len; ) {
+            address token = supportedTokensList[i];
+            uint256 userCollateralShares = userCollateralBalance[user][token];
+            uint256 userBorrowShares = userBorrowBalance[user][token];
+
+            if (userCollateralShares != 0 && totalLiquidationAmountDAI == 0) {
+                address priceFeedAddress = supportedTokens[token].daiPriceFeed;
+                TokenVault memory _vault = vaults[token];
+                uint256 userCollateralAmount = _vault.totalAsset.toAmount(
+                    userCollateralShares,
+                    false
+                );
+                tokenAmountInDai = converttoUSD(
+                    priceFeedAddress,
+                    userCollateralAmount
+                );
+
+                if (totalLiquidationAmountDAI >= tokenAmountInDai) {
+                    totalLiquidationAmountDAI -= tokenAmountInDai;
+                    userCollateralBalance[user][token] = 0;
+                    _vault.totalAsset.shares -= userCollateralShares;
+                } else {
+                    uint256 finalLiquidationAmountInDAI = totalLiquidationAmountDAI;
+                    totalLiquidationAmountDAI = 0;
+                    uint256 liquidatedTokenAmount = convertFromUSD(
+                        priceFeedAddress,
+                        finalLiquidationAmountInDAI
+                    );
+                    uint256 userLiquidatedShares = _vault.totalAsset.toShares(
+                        liquidatedTokenAmount,
+                        false
+                    );
+
+                    userCollateralBalance[user][token] -= userLiquidatedShares;
+                    _vault.totalAsset.shares -= userLiquidatedShares;
+                }
+            }
+
+            if (userBorrowShares != 0 && userRepaidBorrowInDAI == 0) {
+                address priceFeedAddress = supportedTokens[token].daiPriceFeed;
+                TokenVault memory _vault = vaults[token];
+                uint256 userBorrowAmount = _vault.totalBorrow.toAmount(
+                    userBorrowShares,
+                    false
+                );
+                tokenAmountInDai = converttoUSD(
+                    priceFeedAddress,
+                    userBorrowAmount
+                );
+
+                if (userRepaidBorrowInDAI >= tokenAmountInDai) {
+                    userRepaidBorrowInDAI -= tokenAmountInDai;
+                    userBorrowBalance[user][token] = 0;
+                    _vault.totalBorrow.shares -= userBorrowShares;
+                } else {
+                    uint256 finalRepaidAmountInDAI = userRepaidBorrowInDAI;
+                    userRepaidBorrowInDAI = 0;
+                    uint256 repaidTokenAmount = convertFromUSD(
+                        priceFeedAddress,
+                        finalRepaidAmountInDAI
+                    );
+                    uint256 userRepaidShares = _vault.totalBorrow.toShares(
+                        repaidTokenAmount,
+                        false
+                    );
+
+                    userBorrowBalance[user][token] -= userRepaidShares;
+                    _vault.totalBorrow.shares -= userRepaidShares;
+                }
+            }
+
+            unchecked {
+                ++i;
+            }
+        }
 
         emit Liquidated(user, msg.sender);
     }
@@ -185,11 +261,17 @@ contract Pool is PriceConverter, Ownable {
 
         for (uint256 i; i < len; ) {
             address token = supportedTokensList[i];
-            uint256 amount = userCollateralBalance[msg.sender][token];
-            if (amount != 0) {
+            uint256 tokenShares = userCollateralBalance[msg.sender][token];
+
+            TokenVault memory _vault = vaults[token];
+            uint256 tokenAmount = _vault.totalAsset.toAmount(
+                tokenShares,
+                false
+            );
+            if (tokenAmount != 0) {
                 uint256 amountInDai = converttoUSD(
                     supportedTokens[token].daiPriceFeed,
-                    amount
+                    tokenAmount
                 );
                 totalInDai += amountInDai;
             }
@@ -208,11 +290,17 @@ contract Pool is PriceConverter, Ownable {
 
         for (uint256 i; i < len; ) {
             address token = supportedTokensList[i];
-            uint256 amount = userBorrowBalance[msg.sender][token];
-            if (amount != 0) {
+            uint256 tokenShares = userBorrowBalance[msg.sender][token];
+
+            TokenVault memory _vault = vaults[token];
+            uint256 tokenAmount = _vault.totalBorrow.toAmount(
+                tokenShares,
+                false
+            );
+            if (tokenAmount != 0) {
                 uint256 amountInDai = converttoUSD(
                     supportedTokens[token].daiPriceFeed,
-                    amount
+                    tokenAmount
                 );
                 totalInDai += amountInDai;
             }
@@ -237,11 +325,13 @@ contract Pool is PriceConverter, Ownable {
             uint256 totalBorrowAmount
         ) = getUserData(user);
 
-        if (totalBorrowAmount == 0) return 100e18;
+        if (totalBorrowAmount == 0) return 100 * MIN_HEALTH_FACTOR;
 
         uint256 collateralAmountWithThreshold = (collateralAmount *
             LIQUIDATION_THRESHOLD) / 100;
-        factor = (collateralAmountWithThreshold * 1e18) / totalBorrowAmount;
+        factor =
+            (collateralAmountWithThreshold * MIN_HEALTH_FACTOR) /
+            totalBorrowAmount;
     }
 
     //--------------------------------------------------------------------
