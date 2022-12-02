@@ -179,9 +179,11 @@ contract Pool is PriceConverter, Ownable {
             uint256 userCollateralShares = userCollateralBalance[user][token];
             uint256 userBorrowShares = userBorrowBalance[user][token];
 
+            address priceFeedAddress = supportedTokens[token].daiPriceFeed;
+            TokenVault memory _vault = vaults[token];
+
+            // liquidate equivalent of half user collaterals amount
             if (userCollateralShares != 0 && totalLiquidationAmountDAI == 0) {
-                address priceFeedAddress = supportedTokens[token].daiPriceFeed;
-                TokenVault memory _vault = vaults[token];
                 uint256 userCollateralAmount = _vault.totalAsset.toAmount(
                     userCollateralShares,
                     false
@@ -212,9 +214,8 @@ contract Pool is PriceConverter, Ownable {
                 }
             }
 
+            // repay equivalent of half user borrow amount
             if (userBorrowShares != 0 && userRepaidBorrowInDAI == 0) {
-                address priceFeedAddress = supportedTokens[token].daiPriceFeed;
-                TokenVault memory _vault = vaults[token];
                 uint256 userBorrowAmount = _vault.totalBorrow.toAmount(
                     userBorrowShares,
                     false
@@ -228,6 +229,7 @@ contract Pool is PriceConverter, Ownable {
                     userRepaidBorrowInDAI -= tokenAmountInDai;
                     userBorrowBalance[user][token] = 0;
                     _vault.totalBorrow.shares -= userBorrowShares;
+                    _vault.totalBorrow.amount -= userBorrowAmount;
                 } else {
                     uint256 finalRepaidAmountInDAI = userRepaidBorrowInDAI;
                     userRepaidBorrowInDAI = 0;
@@ -242,8 +244,11 @@ contract Pool is PriceConverter, Ownable {
 
                     userBorrowBalance[user][token] -= userRepaidShares;
                     _vault.totalBorrow.shares -= userRepaidShares;
+                    _vault.totalBorrow.amount -= repaidTokenAmount;
                 }
             }
+
+            vaults[token] = _vault;
 
             unchecked {
                 ++i;
