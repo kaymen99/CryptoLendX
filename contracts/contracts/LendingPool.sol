@@ -318,6 +318,18 @@ contract LendingPool is PriceConverter, Ownable, Pausable {
             }
         }
     }
+    
+    function accrueInterest(address token)
+        external
+        returns (
+            uint256 _interestEarned,
+            uint256 _feesAmount,
+            uint256 _feesShare,
+            uint64 _newRate
+        )
+    {
+        return _accrueInterest(token);
+    }
 
     function getUserTotalCollateral(address user)
         public
@@ -401,6 +413,30 @@ contract LendingPool is PriceConverter, Ownable, Pausable {
         factor =
             (collateralAmountWithThreshold * MIN_HEALTH_FACTOR) /
             totalBorrowAmount;
+    }
+    
+    function getUserTokenCollateral(address user, address token)
+        external
+        view
+        returns (uint256 tokenCollateralAmount)
+    {
+        tokenCollateralAmount = userCollateralBalance[user][token];
+    }
+
+    function getUserTokenBorrow(address user, address token)
+        external
+        view
+        returns (uint256 tokenBorrowAmount)
+    {
+        tokenBorrowAmount = userBorrowBalance[user][token];
+    }
+
+    function getTokenVault(address token)
+        public
+        view
+        returns (TokenVault memory vault)
+    {
+        vault = vaults[token];
     }
 
     function _accrueInterest(address token)
