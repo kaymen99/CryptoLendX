@@ -38,6 +38,8 @@ const {
         describe("supply()", () => {
           let erc20Token;
           let tokenPriceFeed;
+          const suppliedAmount = 100;
+
           before(async () => {
             // Deploy Lending Pool contract
             const LendingPool = await ethers.getContractFactory("LendingPool");
@@ -68,11 +70,37 @@ const {
               .connect(owner)
               .addSupportedToken(erc20Token.address, tokenPriceFeed.address);
 
-            const amount = 100;
+            await approveERC20(
+              user1,
+              erc20Token.address,
+              suppliedAmount,
+              pool.address
+            );
 
-            await approveERC20(user1, erc20Token.address, amount, pool.address);
+            const tx = await pool
+              .connect(user1)
+              .supply(erc20Token.address, suppliedAmount);
+            let txReceipt = await tx.wait(1);
 
-            await pool.connect(user1).supply(erc20Token.address, amount);
+            const supplyEvent =
+              txReceipt.events[txReceipt.events.length - 1].args;
+            expect(supplyEvent.user).to.equal(user1.address);
+            expect(supplyEvent.token).to.equal(erc20Token.address);
+            expect(supplyEvent.amount).to.equal(suppliedAmount);
+          });
+          it("should add shares/amount to the token vault", async () => {
+            const vault = await pool.getTokenVault(erc20Token.address);
+
+            expect(vault.totalAsset.amount).to.equal(suppliedAmount);
+            // for first supply we have shares == amount
+            expect(vault.totalAsset.shares).to.equal(suppliedAmount);
+          });
+          it("should update user collateral balance", async () => {
+            const tokenCollateralAmount = await pool.getUserTokenCollateral(
+              user1.address,
+              erc20Token.address
+            );
+            expect(tokenCollateralAmount).to.equal(suppliedAmount);
           });
         });
       });
