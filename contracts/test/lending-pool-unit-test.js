@@ -17,9 +17,10 @@ const {
   : describe("Lending Pool Unit Tests", () => {
       let owner;
       let pool;
+      const day = 86400;
 
       before(async () => {
-        [owner, user1, user2, user3, randomUser] = await ethers.getSigners();
+        [manager, user1, user2, user3, randomUser] = await ethers.getSigners();
       });
 
       describe("Correct Deployement", () => {
@@ -28,9 +29,9 @@ const {
           const LendingPool = await ethers.getContractFactory("LendingPool");
           pool = await LendingPool.deploy();
         });
-        it("Lending Pool contract should have correct owner address", async () => {
-          const ownerAddress = await owner.getAddress();
-          expect(await pool.owner()).to.equal(ownerAddress);
+        it("Lending Pool contract should have correct manager address", async () => {
+          const managerAddress = await manager.getAddress();
+          expect(await pool.manager()).to.equal(managerAddress);
         });
       });
 
@@ -67,7 +68,7 @@ const {
           });
           it("should allow user to supply supported ERC20 tokens", async () => {
             await pool
-              .connect(owner)
+              .connect(manager)
               .addSupportedToken(erc20Token.address, tokenPriceFeed.address);
 
             await approveERC20(
@@ -107,5 +108,5 @@ const {
 
       describe("Update Functions", () => {});
 
-      describe("Admin Functions", () => {});
+      describe("Manager Functions", () => {});
     });
