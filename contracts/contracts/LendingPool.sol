@@ -2,13 +2,12 @@
 
 pragma solidity 0.8.10;
 
-import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/security/Pausable.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "./libraries/VaultAccounting.sol";
-import "./utils/PriceConverter.sol";
+import "./libraries/InterestRate.sol";
 
-contract LendingPool is PriceConverter, Ownable, Pausable {
+contract LendingPool {
     using VaultAccountingLibrary for Vault;
 
     //--------------------------------------------------------------------
@@ -18,22 +17,15 @@ contract LendingPool is PriceConverter, Ownable, Pausable {
     uint256 public constant LIQUIDATION_CLOSE_FACTOR = 50; // 50%
     uint256 public constant LIQUIDATION_REWARD = 5; // 5%
     uint256 public constant MIN_HEALTH_FACTOR = 1e18;
-    uint256 public constant UTILIZATION_PRECISION = 1e5;
+
+    // USE uint256 instead of bool to save gas
+    // paused = 1 && active = 2
+    uint256 public paused = 1;
+    address public manager;
 
     struct SupportedERC20 {
         address daiPriceFeed;
         bool supported;
-    }
-
-    struct InterestRateInfo {
-        uint64 lastBlock;
-        uint64 feeToProtocolRate;
-        uint64 lastTimestamp;
-        uint64 ratePerSec;
-        uint64 optimalUtilization;
-        uint64 baseRate;
-        uint64 slope1;
-        uint64 slope2;
     }
 
     struct TokenVault {
@@ -42,22 +34,14 @@ contract LendingPool is PriceConverter, Ownable, Pausable {
         InterestRateInfo interestRateInfo;
     }
 
-    address[] public supportedTokensList;
+    address[] private supportedTokensList;
     mapping(address => SupportedERC20) supportedTokens;
 
-    mapping(address => TokenVault) vaults;
+    mapping(address => TokenVault) private vaults;
 
     mapping(address => mapping(address => uint256))
-        public userCollateralBalance;
-    mapping(address => mapping(address => uint256)) public userBorrowBalance;
-
-    //--------------------------------------------------------------------
-    /** MODIFIERS */
-
-    modifier allowedToken(address token) {
-        if (!supportedTokens[token].supported) revert TokenNotSupported();
-        _;
-    }
+        private userCollateralBalance;
+    mapping(address => mapping(address => uint256)) private userBorrowBalance;
 
     //--------------------------------------------------------------------
     /** ERRORS */
@@ -67,8 +51,11 @@ contract LendingPool is PriceConverter, Ownable, Pausable {
     error InsufficientBalance();
     error UnderCollateralized();
     error BorrowerIsSolvant();
+    error InvalidLiquidation();
     error AlreadySupported(address token);
+    error OnlyManager();
     error TransferFailed();
+    error PoolIsPaused();
 
     //--------------------------------------------------------------------
     /** EVENTS */
@@ -77,12 +64,8 @@ contract LendingPool is PriceConverter, Ownable, Pausable {
     event Borrow(address user, address token, uint256 amount, uint256 shares);
     event Repay(address user, address token, uint256 amount, uint256 shares);
     event Withdraw(address user, address token, uint256 amount, uint256 shares);
-    event Liquidated(address user, address liquidator, address rewardToken);
-    event UpdateInterestRate(
-        uint256 utilisationRate,
-        uint256 elapsedTime,
-        uint64 newInterestRate
-    );
+    event Liquidated(address user, address liquidator);
+    event UpdateInterestRate(uint256 elapsedTime, uint64 newInterestRate);
     event AccruedInterest(
         uint64 interestRatePerSec,
         uint256 interestEarned,
@@ -91,52 +74,46 @@ contract LendingPool is PriceConverter, Ownable, Pausable {
     );
     event AddSupportedToken(address token);
 
+    constructor() {
+        manager = msg.sender;
+    }
+
     //--------------------------------------------------------------------
     /** FUNCTIONS */
 
-    function supply(address token, uint256 amount)
-        external
-        allowedToken(token)
-    {
+    function supply(address token, uint256 amount) external {
+        WhenNotPaused();
+        allowedToken(token);
+
         _accrueInterest(token);
-        TokenVault memory _vault = vaults[token];
 
-        bool success = IERC20(token).transferFrom(
-            msg.sender,
-            address(this),
-            amount
-        );
-        if (!success) revert TransferFailed();
+        transferERC20(token, msg.sender, address(this), amount);
 
-        uint256 shares = _vault.totalAsset.toShares(amount, false);
-        _vault.totalAsset.shares += uint128(shares);
-        _vault.totalAsset.amount += uint128(amount);
+        uint256 shares = vaults[token].totalAsset.toShares(amount, false);
+        vaults[token].totalAsset.shares += uint128(shares);
+        vaults[token].totalAsset.amount += uint128(amount);
 
         userCollateralBalance[msg.sender][token] += shares;
-        vaults[token] = _vault;
 
         emit Deposit(msg.sender, token, amount, shares);
     }
 
-    function borrow(address token, uint256 amount)
-        external
-        allowedToken(token)
-    {
+    function borrow(address token, uint256 amount) external {
+        WhenNotPaused();
+        allowedToken(token);
+
         _accrueInterest(token);
-        TokenVault memory _vault = vaults[token];
 
         if (amount > IERC20(token).balanceOf(address(this)))
             revert InsufficientBalance();
 
-        bool success = IERC20(token).transfer(msg.sender, amount);
-        if (!success) revert TransferFailed();
-
-        uint256 shares = _vault.totalBorrow.toShares(amount, false);
-        _vault.totalBorrow.shares += uint128(shares);
-        _vault.totalBorrow.amount += uint128(amount);
+        uint256 shares = vaults[token].totalBorrow.toShares(amount, false);
+        vaults[token].totalBorrow.shares += uint128(shares);
+        vaults[token].totalBorrow.amount += uint128(amount);
 
         userBorrowBalance[msg.sender][token] += shares;
-        vaults[token] = _vault;
+
+        transferERC20(token, address(this), msg.sender, amount);
 
         if (healthFactor(msg.sender) <= MIN_HEALTH_FACTOR)
             revert BorrowNotAllowed();
@@ -144,46 +121,35 @@ contract LendingPool is PriceConverter, Ownable, Pausable {
         emit Borrow(msg.sender, token, amount, shares);
     }
 
-    function repay(address token, uint256 amount) external allowedToken(token) {
+    function repay(address token, uint256 amount) external {
         _accrueInterest(token);
-        TokenVault memory _vault = vaults[token];
 
-        bool success = IERC20(token).transferFrom(
-            msg.sender,
-            address(this),
-            amount
-        );
-        if (!success) revert TransferFailed();
+        transferERC20(token, msg.sender, address(this), amount);
 
-        uint256 shares = _vault.totalBorrow.toShares(amount, false);
-        _vault.totalBorrow.shares -= uint128(shares);
-        _vault.totalBorrow.amount -= uint128(amount);
+        uint256 shares = vaults[token].totalBorrow.toShares(amount, false);
+        vaults[token].totalBorrow.shares -= uint128(shares);
+        vaults[token].totalBorrow.amount -= uint128(amount);
 
         userBorrowBalance[msg.sender][token] -= shares;
-        vaults[token] = _vault;
 
         emit Repay(msg.sender, token, amount, shares);
     }
 
-    function withdraw(address token, uint256 amount)
-        external
-        allowedToken(token)
-    {
+    function withdraw(address token, uint256 amount) external {
         _accrueInterest(token);
-        TokenVault memory _vault = vaults[token];
 
-        uint256 shares = _vault.totalAsset.toShares(amount, false);
+        uint256 shares = vaults[token].totalAsset.toShares(amount, false);
         if (userCollateralBalance[msg.sender][token] < shares)
             revert InsufficientBalance();
 
-        bool success = IERC20(token).transfer(msg.sender, amount);
-        if (!success) revert TransferFailed();
+        vaults[token].totalAsset.shares -= uint128(shares);
+        vaults[token].totalAsset.amount -= uint128(amount);
 
-        _vault.totalAsset.shares -= uint128(shares);
-        _vault.totalAsset.amount -= uint128(amount);
+        unchecked {
+            userCollateralBalance[msg.sender][token] -= shares;
+        }
 
-        userCollateralBalance[msg.sender][token] -= shares;
-        vaults[token] = _vault;
+        transferERC20(token, address(this), msg.sender, amount);
 
         if (healthFactor(msg.sender) <= MIN_HEALTH_FACTOR)
             revert UnderCollateralized();
@@ -191,134 +157,66 @@ contract LendingPool is PriceConverter, Ownable, Pausable {
         emit Withdraw(msg.sender, token, amount, shares);
     }
 
-    function liquidate(address account) external {
+    function liquidate(
+        address account,
+        address collateral,
+        address userBorrowToken,
+        uint256 amountToLiquidate
+    ) external {
         if (healthFactor(account) >= MIN_HEALTH_FACTOR)
             revert BorrowerIsSolvant();
 
-        uint256 totalBorrowAmountDAI = getUserTotalBorrow(account);
+        uint256 collateralShares = userCollateralBalance[account][collateral];
+        uint256 borrowShares = userBorrowBalance[account][userBorrowToken];
+        if (collateralShares == 0 || borrowShares == 0) {
+            revert InvalidLiquidation();
+        }
 
-        uint256 totalLiquidationAmountDAI = (totalBorrowAmountDAI *
+        TokenVault memory _borrowTokenVault = vaults[userBorrowToken];
+        uint256 totalBorrowAmount = _borrowTokenVault.totalBorrow.toAmount(
+            borrowShares,
+            false
+        );
+        uint256 maxBorrowAmountToLiquidate = (totalBorrowAmount *
             LIQUIDATION_CLOSE_FACTOR) / 100;
-        uint256 repaidBorrowInDAI = totalLiquidationAmountDAI;
 
-        uint256 liquidationRewardDAI = (totalLiquidationAmountDAI *
-            LIQUIDATION_REWARD) / 100;
+        amountToLiquidate = amountToLiquidate > maxBorrowAmountToLiquidate
+            ? maxBorrowAmountToLiquidate
+            : amountToLiquidate;
 
-        uint256 len = supportedTokensList.length;
-        for (uint256 i; i < len; ) {
-            address token = supportedTokensList[i];
-            (uint256 tokenPrice, uint256 decimals) = getPrice(
-                supportedTokens[token].daiPriceFeed
-            );
+        TokenVault memory _collateralTokenVault = vaults[collateral];
+        uint256 _userCollateralBalance = _collateralTokenVault
+            .totalAsset
+            .toAmount(collateralShares, false);
 
-            uint256 collateralShares = userCollateralBalance[account][token];
-            uint256 borrowShares = userBorrowBalance[account][token];
+        uint256 collateralPrice = getTokenPrice(collateral);
+        uint256 borrowTokenPrice = getTokenPrice(userBorrowToken);
 
-            TokenVault memory _vault = vaults[token];
+        uint256 collateralAmountToLiquidate = (amountToLiquidate *
+            borrowTokenPrice) / collateralPrice;
 
-            // liquidate equivalent of half user collaterals amount
-            if (collateralShares != 0 && totalLiquidationAmountDAI != 0) {
-                _accrueInterest(token);
-
-                uint256 collateralAmount = _vault.totalAsset.toAmount(
-                    collateralShares,
-                    false
-                );
-                uint256 tokenAmountInDai = (collateralAmount * tokenPrice) /
-                    10**decimals;
-
-                uint256 liquidatedShares;
-                if (totalLiquidationAmountDAI >= tokenAmountInDai) {
-                    totalLiquidationAmountDAI -= tokenAmountInDai;
-                    liquidatedShares = collateralShares;
-                    _vault.totalAsset.shares -= uint128(collateralShares);
-                } else {
-                    uint256 liquidatedTokenAmount = (totalLiquidationAmountDAI *
-                        10**decimals) / tokenPrice;
-                    liquidatedShares = _vault.totalAsset.toShares(
-                        liquidatedTokenAmount,
-                        false
-                    );
-                    totalLiquidationAmountDAI = 0;
-                    _vault.totalAsset.shares -= uint128(liquidatedShares);
-                }
-
-                userCollateralBalance[account][token] -= liquidatedShares;
-            }
-
-            // repay equivalent of half user borrow amount
-            if (borrowShares != 0 && repaidBorrowInDAI != 0) {
-                _accrueInterest(token);
-
-                uint256 borrowAmount = _vault.totalBorrow.toAmount(
-                    borrowShares,
-                    false
-                );
-                uint256 tokenAmountInDai = (borrowAmount * tokenPrice) /
-                    10**decimals;
-
-                if (repaidBorrowInDAI >= tokenAmountInDai) {
-                    repaidBorrowInDAI -= tokenAmountInDai;
-                    userBorrowBalance[account][token] = 0;
-                    _vault.totalBorrow.shares -= uint128(borrowShares);
-                    _vault.totalBorrow.amount -= uint128(borrowAmount);
-                } else {
-                    uint256 repaidTokenAmount = (repaidBorrowInDAI *
-                        10**decimals) / tokenPrice;
-                    uint256 repaidShares = _vault.totalBorrow.toShares(
-                        repaidTokenAmount,
-                        false
-                    );
-
-                    repaidBorrowInDAI = 0;
-                    userBorrowBalance[account][token] -= repaidShares;
-                    _vault.totalBorrow.shares -= uint128(repaidShares);
-                    _vault.totalBorrow.amount -= uint128(repaidTokenAmount);
-                }
-            }
-
-            vaults[token] = _vault;
-
-            unchecked {
-                ++i;
-            }
+        if (collateralAmountToLiquidate > _userCollateralBalance) {
+            collateralAmountToLiquidate = _userCollateralBalance;
+            amountToLiquidate =
+                (_userCollateralBalance * collateralPrice) /
+                borrowTokenPrice;
         }
 
-        address rewardToken = _payLiquidator(msg.sender, liquidationRewardDAI);
+        _borrowTokenVault.totalBorrow.shares -= uint128(
+            _borrowTokenVault.totalBorrow.toShares(amountToLiquidate, false)
+        );
+        _borrowTokenVault.totalBorrow.amount -= uint128(amountToLiquidate);
 
-        emit Liquidated(account, msg.sender, rewardToken);
+        _collateralTokenVault.totalAsset.shares -= uint128(
+            collateralAmountToLiquidate
+        );
+
+        vaults[collateral] = _collateralTokenVault;
+        vaults[userBorrowToken] = _borrowTokenVault;
+
+        emit Liquidated(account, msg.sender);
     }
 
-    function _payLiquidator(address liquidator, uint256 rewardInDAI)
-        internal
-        returns (address rewardToken)
-    {
-        uint256 len = supportedTokensList.length;
-        for (uint256 i; i < len; ) {
-            address token = supportedTokensList[i];
-            uint256 tokenBalance = IERC20(token).balanceOf(address(this));
-            (uint256 tokenPrice, uint256 decimals) = getPrice(
-                supportedTokens[token].daiPriceFeed
-            );
-            uint256 tokenBalanceInDAI = (tokenBalance * tokenPrice) /
-                10**decimals;
-
-            if (tokenBalanceInDAI >= rewardInDAI) {
-                rewardToken = token;
-                uint256 amount = (rewardInDAI * 10**decimals) / tokenPrice;
-                bool success = IERC20(token).transfer(liquidator, amount);
-                if (!success) revert TransferFailed();
-
-                vaults[token].totalAsset.amount -= uint128(amount);
-                break;
-            }
-
-            unchecked {
-                ++i;
-            }
-        }
-    }
-    
     function accrueInterest(address token)
         external
         returns (
@@ -337,22 +235,15 @@ contract LendingPool is PriceConverter, Ownable, Pausable {
         returns (uint256 totalInDai)
     {
         uint256 len = supportedTokensList.length;
-
         for (uint256 i; i < len; ) {
             address token = supportedTokensList[i];
-            uint256 tokenShares = userCollateralBalance[user][token];
 
-            TokenVault memory _vault = vaults[token];
-            uint256 tokenAmount = _vault.totalAsset.toAmount(
-                tokenShares,
+            uint256 tokenAmount = vaults[token].totalAsset.toAmount(
+                userCollateralBalance[user][token],
                 false
             );
             if (tokenAmount != 0) {
-                uint256 amountInDai = converttoUSD(
-                    supportedTokens[token].daiPriceFeed,
-                    tokenAmount
-                );
-                totalInDai += amountInDai;
+                totalInDai += getTokenPrice(token) * tokenAmount;
             }
 
             unchecked {
@@ -367,22 +258,15 @@ contract LendingPool is PriceConverter, Ownable, Pausable {
         returns (uint256 totalInDai)
     {
         uint256 len = supportedTokensList.length;
-
         for (uint256 i; i < len; ) {
             address token = supportedTokensList[i];
-            uint256 tokenShares = userBorrowBalance[user][token];
 
-            TokenVault memory _vault = vaults[token];
-            uint256 tokenAmount = _vault.totalBorrow.toAmount(
-                tokenShares,
+            uint256 tokenAmount = vaults[token].totalBorrow.toAmount(
+                userBorrowBalance[user][token],
                 false
             );
             if (tokenAmount != 0) {
-                uint256 amountInDai = converttoUSD(
-                    supportedTokens[token].daiPriceFeed,
-                    tokenAmount
-                );
-                totalInDai += amountInDai;
+                totalInDai += getTokenPrice(token) * tokenAmount;
             }
 
             unchecked {
@@ -400,6 +284,15 @@ contract LendingPool is PriceConverter, Ownable, Pausable {
         totalBorrow = getUserTotalBorrow(user);
     }
 
+    function getUserTokenCollateralAndBorrow(address user, address token)
+        external
+        view
+        returns (uint256 tokenCollateralAmount, uint256 tokenBorrowAmount)
+    {
+        tokenCollateralAmount = userCollateralBalance[user][token];
+        tokenBorrowAmount = userBorrowBalance[user][token];
+    }
+
     function healthFactor(address user) public view returns (uint256 factor) {
         (
             uint256 totalCollateralAmount,
@@ -414,22 +307,6 @@ contract LendingPool is PriceConverter, Ownable, Pausable {
             (collateralAmountWithThreshold * MIN_HEALTH_FACTOR) /
             totalBorrowAmount;
     }
-    
-    function getUserTokenCollateral(address user, address token)
-        external
-        view
-        returns (uint256 tokenCollateralAmount)
-    {
-        tokenCollateralAmount = userCollateralBalance[user][token];
-    }
-
-    function getUserTokenBorrow(address user, address token)
-        external
-        view
-        returns (uint256 tokenBorrowAmount)
-    {
-        tokenBorrowAmount = userBorrowBalance[user][token];
-    }
 
     function getTokenVault(address token)
         public
@@ -438,6 +315,22 @@ contract LendingPool is PriceConverter, Ownable, Pausable {
     {
         vault = vaults[token];
     }
+
+    function getTokenPrice(address token) public view returns (uint256) {
+        AggregatorV3Interface priceFeed = AggregatorV3Interface(
+            supportedTokens[token].daiPriceFeed
+        );
+        (, int256 price, , , ) = priceFeed.latestRoundData();
+        uint256 decimals = priceFeed.decimals();
+        return uint256(price) / 10**decimals;
+    }
+
+    function getTokenInterestRate(address token) public view returns (uint256) {
+        return vaults[token].interestRateInfo.ratePerSec;
+    }
+
+    //--------------------------------------------------------------------
+    /** INTERNAL FUNCTIONS */
 
     function _accrueInterest(address token)
         internal
@@ -462,7 +355,7 @@ contract LendingPool is PriceConverter, Ownable, Pausable {
         }
 
         // If there are no borrows or contract is paused, no interest accrues
-        if (_vault.totalBorrow.shares == 0 || paused()) {
+        if (_vault.totalBorrow.shares == 0 || paused == 1) {
             _currentRateInfo.lastTimestamp = uint64(block.timestamp);
             _currentRateInfo.lastBlock = uint64(block.number);
             _vault.interestRateInfo = _currentRateInfo;
@@ -470,12 +363,13 @@ contract LendingPool is PriceConverter, Ownable, Pausable {
             uint256 _deltaTime = block.timestamp -
                 _currentRateInfo.lastTimestamp;
 
-            uint256 _utilizationRate = (UTILIZATION_PRECISION *
-                _vault.totalBorrow.amount) / _vault.totalAsset.amount;
+            _newRate = InterestRate.calculateInterestRate(
+                _currentRateInfo,
+                _vault.totalAsset.amount,
+                _vault.totalBorrow.amount
+            );
 
-            _newRate = getNewRate(_currentRateInfo, _utilizationRate);
-
-            emit UpdateInterestRate(_utilizationRate, _deltaTime, _newRate);
+            emit UpdateInterestRate(_deltaTime, _newRate);
 
             _currentRateInfo.ratePerSec = _newRate;
             _currentRateInfo.lastTimestamp = uint64(block.timestamp);
@@ -489,7 +383,6 @@ contract LendingPool is PriceConverter, Ownable, Pausable {
                 1e18;
 
             // Accumulate interest and fees
-
             _vault.totalBorrow.amount += uint128(_interestEarned);
             _vault.totalAsset.amount += uint128(_interestEarned);
 
@@ -517,50 +410,39 @@ contract LendingPool is PriceConverter, Ownable, Pausable {
         }
     }
 
-    function getNewRate(
-        InterestRateInfo memory _interestRateInfo,
-        uint256 _utilization
-    ) internal pure returns (uint64 _newRatePerSec) {
-        uint256 optimalUtilization = uint256(
-            _interestRateInfo.optimalUtilization
-        );
-        uint256 baseRate = uint256(_interestRateInfo.baseRate);
-        uint256 slope1 = uint256(_interestRateInfo.slope1);
-        uint256 slope2 = uint256(_interestRateInfo.slope2);
+    function allowedToken(address token) internal view {
+        if (!supportedTokens[token].supported) revert TokenNotSupported();
+    }
 
-        if (_utilization <= optimalUtilization) {
-            uint256 _slope = (slope1 * UTILIZATION_PRECISION) /
-                optimalUtilization;
-            _newRatePerSec = uint64(
-                baseRate + ((_utilization * _slope) / UTILIZATION_PRECISION)
-            );
+    function WhenNotPaused() internal view {
+        if (paused == 1) revert PoolIsPaused();
+    }
+
+    function transferERC20(
+        address _token,
+        address _from,
+        address _to,
+        uint256 _amount
+    ) internal {
+        bool success;
+        if (_from == address(this)) {
+            success = IERC20(_token).transfer(_to, _amount);
         } else {
-            uint256 _slope = ((slope2 * UTILIZATION_PRECISION) /
-                (UTILIZATION_PRECISION - optimalUtilization));
-            _newRatePerSec = uint64(
-                baseRate +
-                    slope1 +
-                    (((_utilization - optimalUtilization) * _slope) /
-                        UTILIZATION_PRECISION)
-            );
+            success = IERC20(_token).transferFrom(_from, _to, _amount);
         }
+        if (!success) revert TransferFailed();
     }
 
     //--------------------------------------------------------------------
     /** OWNER FUNCTIONS */
 
-    function setPaused() external onlyOwner {
-        if (paused()) {
-            _unpause();
-        } else {
-            _pause();
-        }
+    function setPaused(uint256 _state) external {
+        if (msg.sender != manager) revert OnlyManager();
+        if (_state == 1 || _state == 2) paused = _state;
     }
 
-    function addSupportedToken(address token, address priceFeed)
-        external
-        onlyOwner
-    {
+    function addSupportedToken(address token, address priceFeed) external {
+        if (msg.sender != manager) revert OnlyManager();
         if (supportedTokens[token].supported) revert AlreadySupported(token);
 
         supportedTokens[token].daiPriceFeed = priceFeed;
