@@ -172,52 +172,91 @@ contract LendingPool {
             revert InvalidLiquidation();
         }
 
-        TokenVault memory _borrowTokenVault = vaults[userBorrowToken];
-        uint256 totalBorrowAmount = _borrowTokenVault.totalBorrow.toAmount(
-            borrowShares,
+        TokenVault memory _borrowVault = vaults[userBorrowToken];
+        {
+            uint256 totalBorrowAmount = _borrowVault.totalBorrow.toAmount(
+                borrowShares,
+                false
+            );
+            uint256 maxBorrowAmountToLiquidate = (totalBorrowAmount *
+                LIQUIDATION_CLOSE_FACTOR) / 100;
+
+            amountToLiquidate = amountToLiquidate > maxBorrowAmountToLiquidate
+                ? maxBorrowAmountToLiquidate
+                : amountToLiquidate;
+        }
+
+        TokenVault memory _collateralVault = vaults[collateral];
+        uint256 _userCollateralBalance = _collateralVault.totalAsset.toAmount(
+            collateralShares,
             false
         );
-        uint256 maxBorrowAmountToLiquidate = (totalBorrowAmount *
-            LIQUIDATION_CLOSE_FACTOR) / 100;
-
-        amountToLiquidate = amountToLiquidate > maxBorrowAmountToLiquidate
-            ? maxBorrowAmountToLiquidate
-            : amountToLiquidate;
-
-        TokenVault memory _collateralTokenVault = vaults[collateral];
-        uint256 _userCollateralBalance = _collateralTokenVault
-            .totalAsset
-            .toAmount(collateralShares, false);
 
         uint256 collateralPrice = getTokenPrice(collateral);
         uint256 borrowTokenPrice = getTokenPrice(userBorrowToken);
 
         uint256 collateralAmountToLiquidate = (amountToLiquidate *
             borrowTokenPrice) / collateralPrice;
+        uint256 maxLiquidationReward = (collateralAmountToLiquidate *
+            LIQUIDATION_REWARD) / 100;
 
+        uint256 liquidationReward;
         if (collateralAmountToLiquidate > _userCollateralBalance) {
             collateralAmountToLiquidate = _userCollateralBalance;
             amountToLiquidate =
                 (_userCollateralBalance * collateralPrice) /
                 borrowTokenPrice;
+        } else {
+            uint256 collateralBalanceAfter = _userCollateralBalance -
+                collateralAmountToLiquidate;
+            liquidationReward = maxLiquidationReward > collateralBalanceAfter
+                ? collateralBalanceAfter
+                : maxLiquidationReward;
         }
 
-        _borrowTokenVault.totalBorrow.shares -= uint128(
-            _borrowTokenVault.totalBorrow.toShares(amountToLiquidate, false)
+        // Update borrow vault
+        _borrowVault.totalBorrow.shares -= uint128(
+            _borrowVault.totalBorrow.toShares(amountToLiquidate, false)
         );
-        _borrowTokenVault.totalBorrow.amount -= uint128(amountToLiquidate);
+        _borrowVault.totalBorrow.amount -= uint128(amountToLiquidate);
 
-        _collateralTokenVault.totalAsset.shares -= uint128(
-            collateralAmountToLiquidate
+        // Update collateral vault
+        _collateralVault.totalAsset.shares -= uint128(
+            _collateralVault.totalAsset.toShares(
+                collateralAmountToLiquidate + liquidationReward,
+                false
+            )
+        );
+        _collateralVault.totalAsset.amount -= uint128(
+            collateralAmountToLiquidate + liquidationReward
         );
 
-        vaults[collateral] = _collateralTokenVault;
-        vaults[userBorrowToken] = _borrowTokenVault;
+        // Repay borrowed amount
+        transferERC20(
+            userBorrowToken,
+            msg.sender,
+            address(this),
+            amountToLiquidate
+        );
+
+        // Transfer collateral & liquidation reward to liquidator
+        transferERC20(
+            collateral,
+            address(this),
+            msg.sender,
+            collateralAmountToLiquidate + liquidationReward
+        );
+
+        // Save vaults states
+        vaults[collateral] = _collateralVault;
+        vaults[userBorrowToken] = _borrowVault;
 
         emit Liquidated(account, msg.sender);
     }
 
-    function accrueInterest(address token)
+    function accrueInterest(
+        address token
+    )
         external
         returns (
             uint256 _interestEarned,
@@ -229,11 +268,9 @@ contract LendingPool {
         return _accrueInterest(token);
     }
 
-    function getUserTotalCollateral(address user)
-        public
-        view
-        returns (uint256 totalInDai)
-    {
+    function getUserTotalCollateral(
+        address user
+    ) public view returns (uint256 totalInDai) {
         uint256 len = supportedTokensList.length;
         for (uint256 i; i < len; ) {
             address token = supportedTokensList[i];
@@ -252,11 +289,9 @@ contract LendingPool {
         }
     }
 
-    function getUserTotalBorrow(address user)
-        public
-        view
-        returns (uint256 totalInDai)
-    {
+    function getUserTotalBorrow(
+        address user
+    ) public view returns (uint256 totalInDai) {
         uint256 len = supportedTokensList.length;
         for (uint256 i; i < len; ) {
             address token = supportedTokensList[i];
@@ -275,16 +310,17 @@ contract LendingPool {
         }
     }
 
-    function getUserData(address user)
-        public
-        view
-        returns (uint256 totalCollateral, uint256 totalBorrow)
-    {
+    function getUserData(
+        address user
+    ) public view returns (uint256 totalCollateral, uint256 totalBorrow) {
         totalCollateral = getUserTotalCollateral(user);
         totalBorrow = getUserTotalBorrow(user);
     }
 
-    function getUserTokenCollateralAndBorrow(address user, address token)
+    function getUserTokenCollateralAndBorrow(
+        address user,
+        address token
+    )
         external
         view
         returns (uint256 tokenCollateralAmount, uint256 tokenBorrowAmount)
@@ -308,11 +344,9 @@ contract LendingPool {
             totalBorrowAmount;
     }
 
-    function getTokenVault(address token)
-        public
-        view
-        returns (TokenVault memory vault)
-    {
+    function getTokenVault(
+        address token
+    ) public view returns (TokenVault memory vault) {
         vault = vaults[token];
     }
 
@@ -322,7 +356,7 @@ contract LendingPool {
         );
         (, int256 price, , , ) = priceFeed.latestRoundData();
         uint256 decimals = priceFeed.decimals();
-        return uint256(price) / 10**decimals;
+        return uint256(price) / 10 ** decimals;
     }
 
     function getTokenInterestRate(address token) public view returns (uint256) {
@@ -332,7 +366,9 @@ contract LendingPool {
     //--------------------------------------------------------------------
     /** INTERNAL FUNCTIONS */
 
-    function _accrueInterest(address token)
+    function _accrueInterest(
+        address token
+    )
         internal
         returns (
             uint256 _interestEarned,
