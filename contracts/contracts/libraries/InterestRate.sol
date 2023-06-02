@@ -1,4 +1,5 @@
-// SPDX-License-Identifier: ISC
+// SPDX-License-Identifier: MIT
+
 pragma solidity ^0.8.10;
 
 struct InterestRateInfo {
@@ -12,17 +13,21 @@ struct InterestRateInfo {
     uint64 slope2;
 }
 
+struct InterestRateParams {
+    uint64 feeToProtocolRate;
+    uint64 optimalUtilization;
+    uint64 baseRate;
+    uint64 slope1;
+    uint64 slope2;
+}
+
 library InterestRate {
-    uint256 public constant UTILIZATION_PRECISION = 1e5;
+    uint256 internal constant RATE_PRECISION = 1e18;
 
     function calculateInterestRate(
         InterestRateInfo memory _interestRateInfo,
-        uint256 totalAssetAmount,
-        uint256 totalBorrowAmount
-    ) internal pure returns (uint64 _newRatePerSec) {
-        uint256 utilization = (UTILIZATION_PRECISION * totalBorrowAmount) /
-            totalAssetAmount;
-
+        uint256 utilization
+    ) internal pure returns (uint256 newRatePerSec) {
         uint256 optimalUtilization = uint256(
             _interestRateInfo.optimalUtilization
         );
@@ -31,20 +36,17 @@ library InterestRate {
         uint256 slope2 = uint256(_interestRateInfo.slope2);
 
         if (utilization <= optimalUtilization) {
-            uint256 _slope = (slope1 * UTILIZATION_PRECISION) /
-                optimalUtilization;
-            _newRatePerSec = uint64(
-                baseRate + ((utilization * _slope) / UTILIZATION_PRECISION)
-            );
+            uint256 rate = (utilization * slope1) / optimalUtilization;
+            newRatePerSec = baseRate + rate;
         } else {
-            uint256 _slope = ((slope2 * UTILIZATION_PRECISION) /
-                (UTILIZATION_PRECISION - optimalUtilization));
-            _newRatePerSec = uint64(
+            uint256 utilizationDelta = utilization - optimalUtilization;
+            uint256 excessUtilizationRate = (utilizationDelta *
+                RATE_PRECISION) / (RATE_PRECISION - optimalUtilization);
+            newRatePerSec =
                 baseRate +
-                    slope1 +
-                    (((utilization - optimalUtilization) * _slope) /
-                        UTILIZATION_PRECISION)
-            );
+                slope1 +
+                (excessUtilizationRate * slope2) /
+                RATE_PRECISION;
         }
     }
 }
