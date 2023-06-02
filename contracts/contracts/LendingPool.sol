@@ -4,27 +4,20 @@ pragma solidity 0.8.10;
 
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
 import "./libraries/VaultAccounting.sol";
 import "./libraries/InterestRate.sol";
+import "./utils/Pausable.sol";
+import "./utils/Constants.sol";
 
-contract LendingPool {
+contract LendingPool is Pausable, Constants {
     using VaultAccountingLibrary for Vault;
 
     //--------------------------------------------------------------------
     /** VARIABLES */
 
-    uint256 public constant LIQUIDATION_THRESHOLD = 80; // 80%
-    uint256 public constant LIQUIDATION_CLOSE_FACTOR = 50; // 50%
-    uint256 public constant LIQUIDATION_REWARD = 5; // 5%
-    uint256 public constant MIN_HEALTH_FACTOR = 1e18;
-
-    // USE uint256 instead of bool to save gas
-    // paused = 1 && active = 2
-    uint256 public paused = 1;
-    address public manager;
-
     struct SupportedERC20 {
-        address daiPriceFeed;
+        address usdPriceFeed;
         bool supported;
     }
 
@@ -40,8 +33,8 @@ contract LendingPool {
     mapping(address => TokenVault) private vaults;
 
     mapping(address => mapping(address => uint256))
-        private userCollateralBalance;
-    mapping(address => mapping(address => uint256)) private userBorrowBalance;
+        private userCollateralShares;
+    mapping(address => mapping(address => uint256)) private userBorrowShares;
 
     //--------------------------------------------------------------------
     /** ERRORS */
@@ -52,10 +45,10 @@ contract LendingPool {
     error UnderCollateralized();
     error BorrowerIsSolvant();
     error InvalidLiquidation();
+    error InvalidFeeAmount(uint fee);
     error AlreadySupported(address token);
     error OnlyManager();
     error TransferFailed();
-    error PoolIsPaused();
 
     //--------------------------------------------------------------------
     /** EVENTS */
@@ -74,46 +67,37 @@ contract LendingPool {
     );
     event AddSupportedToken(address token);
 
-    constructor() {
-        manager = msg.sender;
-    }
-
     //--------------------------------------------------------------------
     /** FUNCTIONS */
 
     function supply(address token, uint256 amount) external {
         WhenNotPaused();
         allowedToken(token);
-
         _accrueInterest(token);
 
-        transferERC20(token, msg.sender, address(this), amount);
-
+        _transferERC20(token, msg.sender, address(this), amount);
         uint256 shares = vaults[token].totalAsset.toShares(amount, false);
+
         vaults[token].totalAsset.shares += uint128(shares);
         vaults[token].totalAsset.amount += uint128(amount);
-
-        userCollateralBalance[msg.sender][token] += shares;
+        userCollateralShares[msg.sender][token] += shares;
 
         emit Deposit(msg.sender, token, amount, shares);
     }
 
     function borrow(address token, uint256 amount) external {
         WhenNotPaused();
-        allowedToken(token);
-
-        _accrueInterest(token);
-
         if (amount > IERC20(token).balanceOf(address(this)))
             revert InsufficientBalance();
 
+        _accrueInterest(token);
         uint256 shares = vaults[token].totalBorrow.toShares(amount, false);
+
         vaults[token].totalBorrow.shares += uint128(shares);
         vaults[token].totalBorrow.amount += uint128(amount);
+        userBorrowShares[msg.sender][token] += shares;
 
-        userBorrowBalance[msg.sender][token] += shares;
-
-        transferERC20(token, address(this), msg.sender, amount);
+        _transferERC20(token, address(this), msg.sender, amount);
 
         if (healthFactor(msg.sender) <= MIN_HEALTH_FACTOR)
             revert BorrowNotAllowed();
@@ -124,32 +108,64 @@ contract LendingPool {
     function repay(address token, uint256 amount) external {
         _accrueInterest(token);
 
-        transferERC20(token, msg.sender, address(this), amount);
-
+        uint256 userBorrowShare = userBorrowShares[msg.sender][token];
         uint256 shares = vaults[token].totalBorrow.toShares(amount, false);
-        vaults[token].totalBorrow.shares -= uint128(shares);
-        vaults[token].totalBorrow.amount -= uint128(amount);
+        if (amount == type(uint256).max || shares > userBorrowShare) {
+            shares = userBorrowShare;
+            amount = vaults[token].totalBorrow.toAmount(shares, false);
+        }
 
-        userBorrowBalance[msg.sender][token] -= shares;
+        _transferERC20(token, msg.sender, address(this), amount);
+        unchecked {
+            vaults[token].totalBorrow.shares -= uint128(shares);
+            vaults[token].totalBorrow.amount -= uint128(amount);
+            userBorrowShares[msg.sender][token] = userBorrowShare - shares;
+        }
 
         emit Repay(msg.sender, token, amount, shares);
     }
 
     function withdraw(address token, uint256 amount) external {
+        uint256 userShares = userCollateralShares[msg.sender][token];
+        uint256 shares = vaults[token].totalAsset.toShares(amount, false);
+        if (
+            userShares < shares ||
+            IERC20(token).balanceOf(address(this)) < amount
+        ) revert InsufficientBalance();
+
         _accrueInterest(token);
 
-        uint256 shares = vaults[token].totalAsset.toShares(amount, false);
-        if (userCollateralBalance[msg.sender][token] < shares)
-            revert InsufficientBalance();
-
-        vaults[token].totalAsset.shares -= uint128(shares);
-        vaults[token].totalAsset.amount -= uint128(amount);
-
         unchecked {
-            userCollateralBalance[msg.sender][token] -= shares;
+            vaults[token].totalAsset.shares -= uint128(shares);
+            vaults[token].totalAsset.amount -= uint128(amount);
+            userCollateralShares[msg.sender][token] -= shares;
         }
 
-        transferERC20(token, address(this), msg.sender, amount);
+        _transferERC20(token, address(this), msg.sender, amount);
+
+        if (healthFactor(msg.sender) <= MIN_HEALTH_FACTOR)
+            revert UnderCollateralized();
+
+        emit Withdraw(msg.sender, token, amount, shares);
+    }
+
+    function redeem(address token, uint256 shares) external {
+        uint256 userShares = userCollateralShares[msg.sender][token];
+        uint256 amount = vaults[token].totalAsset.toAmount(shares, false);
+        if (
+            userShares < shares ||
+            IERC20(token).balanceOf(address(this)) < amount
+        ) revert InsufficientBalance();
+
+        _accrueInterest(token);
+
+        unchecked {
+            vaults[token].totalAsset.shares -= uint128(shares);
+            vaults[token].totalAsset.amount -= uint128(amount);
+            userCollateralShares[msg.sender][token] = userShares - shares;
+        }
+
+        _transferERC20(token, address(this), msg.sender, amount);
 
         if (healthFactor(msg.sender) <= MIN_HEALTH_FACTOR)
             revert UnderCollateralized();
@@ -166,8 +182,8 @@ contract LendingPool {
         if (healthFactor(account) >= MIN_HEALTH_FACTOR)
             revert BorrowerIsSolvant();
 
-        uint256 collateralShares = userCollateralBalance[account][collateral];
-        uint256 borrowShares = userBorrowBalance[account][userBorrowToken];
+        uint256 collateralShares = userCollateralShares[account][collateral];
+        uint256 borrowShares = userBorrowShares[account][userBorrowToken];
         if (collateralShares == 0 || borrowShares == 0) {
             revert InvalidLiquidation();
         }
@@ -179,7 +195,7 @@ contract LendingPool {
                 false
             );
             uint256 maxBorrowAmountToLiquidate = (totalBorrowAmount *
-                LIQUIDATION_CLOSE_FACTOR) / 100;
+                LIQUIDATION_CLOSE_FACTOR) / PRECISION;
 
             amountToLiquidate = amountToLiquidate > maxBorrowAmountToLiquidate
                 ? maxBorrowAmountToLiquidate
@@ -187,52 +203,59 @@ contract LendingPool {
         }
 
         TokenVault memory _collateralVault = vaults[collateral];
-        uint256 _userCollateralBalance = _collateralVault.totalAsset.toAmount(
-            collateralShares,
-            false
-        );
 
-        uint256 collateralPrice = getTokenPrice(collateral);
-        uint256 borrowTokenPrice = getTokenPrice(userBorrowToken);
-
-        uint256 collateralAmountToLiquidate = (amountToLiquidate *
-            borrowTokenPrice) / collateralPrice;
-        uint256 maxLiquidationReward = (collateralAmountToLiquidate *
-            LIQUIDATION_REWARD) / 100;
-
+        uint256 collateralAmountToLiquidate;
         uint256 liquidationReward;
-        if (collateralAmountToLiquidate > _userCollateralBalance) {
-            collateralAmountToLiquidate = _userCollateralBalance;
-            amountToLiquidate =
-                (_userCollateralBalance * collateralPrice) /
-                borrowTokenPrice;
-        } else {
-            uint256 collateralBalanceAfter = _userCollateralBalance -
-                collateralAmountToLiquidate;
-            liquidationReward = maxLiquidationReward > collateralBalanceAfter
-                ? collateralBalanceAfter
-                : maxLiquidationReward;
+        {
+            // avoid stack too deep error
+
+            uint256 _userTotalCollateralAmount = _collateralVault
+                .totalAsset
+                .toAmount(collateralShares, false);
+
+            uint256 collateralPrice = getTokenPrice(collateral);
+            uint256 borrowTokenPrice = getTokenPrice(userBorrowToken);
+
+            collateralAmountToLiquidate =
+                (amountToLiquidate * borrowTokenPrice) /
+                collateralPrice;
+            uint256 maxLiquidationReward = (collateralAmountToLiquidate *
+                LIQUIDATION_REWARD) / PRECISION;
+
+            if (collateralAmountToLiquidate > _userTotalCollateralAmount) {
+                collateralAmountToLiquidate = _userTotalCollateralAmount;
+                amountToLiquidate =
+                    (_userTotalCollateralAmount * collateralPrice) /
+                    borrowTokenPrice;
+            } else {
+                uint256 collateralBalanceAfter = _userTotalCollateralAmount -
+                    collateralAmountToLiquidate;
+                liquidationReward = maxLiquidationReward >
+                    collateralBalanceAfter
+                    ? collateralBalanceAfter
+                    : maxLiquidationReward;
+            }
+
+            // Update borrow vault
+            _borrowVault.totalBorrow.shares -= uint128(
+                _borrowVault.totalBorrow.toShares(amountToLiquidate, false)
+            );
+            _borrowVault.totalBorrow.amount -= uint128(amountToLiquidate);
+
+            // Update collateral vault
+            _collateralVault.totalAsset.shares -= uint128(
+                _collateralVault.totalAsset.toShares(
+                    collateralAmountToLiquidate + liquidationReward,
+                    false
+                )
+            );
+            _collateralVault.totalAsset.amount -= uint128(
+                collateralAmountToLiquidate + liquidationReward
+            );
         }
 
-        // Update borrow vault
-        _borrowVault.totalBorrow.shares -= uint128(
-            _borrowVault.totalBorrow.toShares(amountToLiquidate, false)
-        );
-        _borrowVault.totalBorrow.amount -= uint128(amountToLiquidate);
-
-        // Update collateral vault
-        _collateralVault.totalAsset.shares -= uint128(
-            _collateralVault.totalAsset.toShares(
-                collateralAmountToLiquidate + liquidationReward,
-                false
-            )
-        );
-        _collateralVault.totalAsset.amount -= uint128(
-            collateralAmountToLiquidate + liquidationReward
-        );
-
         // Repay borrowed amount
-        transferERC20(
+        _transferERC20(
             userBorrowToken,
             msg.sender,
             address(this),
@@ -240,7 +263,7 @@ contract LendingPool {
         );
 
         // Transfer collateral & liquidation reward to liquidator
-        transferERC20(
+        _transferERC20(
             collateral,
             address(this),
             msg.sender,
@@ -276,7 +299,7 @@ contract LendingPool {
             address token = supportedTokensList[i];
 
             uint256 tokenAmount = vaults[token].totalAsset.toAmount(
-                userCollateralBalance[user][token],
+                userCollateralShares[user][token],
                 false
             );
             if (tokenAmount != 0) {
@@ -297,7 +320,7 @@ contract LendingPool {
             address token = supportedTokensList[i];
 
             uint256 tokenAmount = vaults[token].totalBorrow.toAmount(
-                userBorrowBalance[user][token],
+                userBorrowShares[user][token],
                 false
             );
             if (tokenAmount != 0) {
@@ -325,8 +348,8 @@ contract LendingPool {
         view
         returns (uint256 tokenCollateralAmount, uint256 tokenBorrowAmount)
     {
-        tokenCollateralAmount = userCollateralBalance[user][token];
-        tokenBorrowAmount = userBorrowBalance[user][token];
+        tokenCollateralAmount = userCollateralShares[user][token];
+        tokenBorrowAmount = userBorrowShares[user][token];
     }
 
     function healthFactor(address user) public view returns (uint256 factor) {
@@ -338,10 +361,20 @@ contract LendingPool {
         if (totalBorrowAmount == 0) return 100 * MIN_HEALTH_FACTOR;
 
         uint256 collateralAmountWithThreshold = (totalCollateralAmount *
-            LIQUIDATION_THRESHOLD) / 100;
+            LIQUIDATION_THRESHOLD) / PRECISION;
         factor =
             (collateralAmountWithThreshold * MIN_HEALTH_FACTOR) /
             totalBorrowAmount;
+    }
+
+    function getTokenPrice(address token) public view returns (uint256) {
+        AggregatorV3Interface priceFeed = AggregatorV3Interface(
+            supportedTokens[token].usdPriceFeed
+        );
+        (, int256 price, , , ) = priceFeed.latestRoundData();
+
+        // return price in USD scaled by priceFeed.decimals()
+        return uint256(price);
     }
 
     function getTokenVault(
@@ -350,17 +383,34 @@ contract LendingPool {
         vault = vaults[token];
     }
 
-    function getTokenPrice(address token) public view returns (uint256) {
-        AggregatorV3Interface priceFeed = AggregatorV3Interface(
-            supportedTokens[token].daiPriceFeed
-        );
-        (, int256 price, , , ) = priceFeed.latestRoundData();
-        uint256 decimals = priceFeed.decimals();
-        return uint256(price) / 10 ** decimals;
+    function getTokenInterestRateInfo(
+        address token
+    ) external view returns (InterestRateInfo memory) {
+        return vaults[token].interestRateInfo;
     }
 
-    function getTokenInterestRate(address token) public view returns (uint256) {
-        return vaults[token].interestRateInfo.ratePerSec;
+    function amountToShares(
+        address token,
+        uint256 amount,
+        bool isAsset
+    ) external view returns (uint256 shares) {
+        if (isAsset) {
+            shares = uint256(vaults[token].totalAsset.toShares(amount, false));
+        } else {
+            shares = uint256(vaults[token].totalBorrow.toShares(amount, false));
+        }
+    }
+
+    function sharesToAmount(
+        address token,
+        uint256 shares,
+        bool isAsset
+    ) external view returns (uint256 amount) {
+        if (isAsset) {
+            amount = uint256(vaults[token].totalAsset.toAmount(shares, false));
+        } else {
+            amount = uint256(vaults[token].totalBorrow.toAmount(shares, false));
+        }
     }
 
     //--------------------------------------------------------------------
@@ -374,7 +424,7 @@ contract LendingPool {
             uint256 _interestEarned,
             uint256 _feesAmount,
             uint256 _feesShare,
-            uint64 _newRate
+            uint64 newRate
         )
     {
         TokenVault memory _vault = vaults[token];
@@ -386,45 +436,54 @@ contract LendingPool {
         // Add interest only once per block
         InterestRateInfo memory _currentRateInfo = _vault.interestRateInfo;
         if (_currentRateInfo.lastTimestamp == block.timestamp) {
-            _newRate = _currentRateInfo.ratePerSec;
-            return (_interestEarned, _feesAmount, _feesShare, _newRate);
+            newRate = _currentRateInfo.ratePerSec;
+            return (_interestEarned, _feesAmount, _feesShare, newRate);
         }
 
         // If there are no borrows or contract is paused, no interest accrues
         if (_vault.totalBorrow.shares == 0 || paused == 1) {
+            if (paused == 2) {
+                _currentRateInfo.ratePerSec = DEFAULT_INTEREST;
+            }
             _currentRateInfo.lastTimestamp = uint64(block.timestamp);
             _currentRateInfo.lastBlock = uint64(block.number);
             _vault.interestRateInfo = _currentRateInfo;
         } else {
-            uint256 _deltaTime = block.timestamp -
-                _currentRateInfo.lastTimestamp;
+            uint256 _deltaTime = block.number - _currentRateInfo.lastBlock;
 
-            _newRate = InterestRate.calculateInterestRate(
+            uint _utilization = (_vault.totalBorrow.amount * RATE_PRECISION) /
+                _vault.totalAsset.amount;
+
+            // Calculate new interest rate
+            uint256 _newRate = InterestRate.calculateInterestRate(
                 _currentRateInfo,
-                _vault.totalAsset.amount,
-                _vault.totalBorrow.amount
+                _utilization
             );
 
-            emit UpdateInterestRate(_deltaTime, _newRate);
+            newRate = uint64(_newRate);
 
-            _currentRateInfo.ratePerSec = _newRate;
+            _currentRateInfo.ratePerSec = newRate;
             _currentRateInfo.lastTimestamp = uint64(block.timestamp);
             _currentRateInfo.lastBlock = uint64(block.number);
+
+            emit UpdateInterestRate(_deltaTime, newRate);
 
             // Calculate interest accrued
             _interestEarned =
                 (_deltaTime *
                     _vault.totalBorrow.amount *
                     _currentRateInfo.ratePerSec) /
-                1e18;
+                (RATE_PRECISION * BLOCKS_PER_YEAR);
 
             // Accumulate interest and fees
             _vault.totalBorrow.amount += uint128(_interestEarned);
             _vault.totalAsset.amount += uint128(_interestEarned);
+            _vault.interestRateInfo = _currentRateInfo;
 
             if (_currentRateInfo.feeToProtocolRate > 0) {
-                _feesAmount = (_interestEarned *
-                    _currentRateInfo.feeToProtocolRate);
+                _feesAmount =
+                    (_interestEarned * _currentRateInfo.feeToProtocolRate) /
+                    PRECISION;
 
                 _feesShare =
                     (_feesAmount * _vault.totalAsset.shares) /
@@ -433,7 +492,7 @@ contract LendingPool {
                 _vault.totalAsset.shares += uint128(_feesShare);
 
                 // give fee shares to this contract
-                userCollateralBalance[address(this)][token] += _feesShare;
+                userCollateralShares[address(this)][token] += _feesShare;
             }
             emit AccruedInterest(
                 _currentRateInfo.ratePerSec,
@@ -441,20 +500,16 @@ contract LendingPool {
                 _feesAmount,
                 _feesShare
             );
-
-            _vault = vaults[token];
         }
+        // save to storage
+        vaults[token] = _vault;
     }
 
     function allowedToken(address token) internal view {
         if (!supportedTokens[token].supported) revert TokenNotSupported();
     }
 
-    function WhenNotPaused() internal view {
-        if (paused == 1) revert PoolIsPaused();
-    }
-
-    function transferERC20(
+    function _transferERC20(
         address _token,
         address _from,
         address _to,
@@ -472,18 +527,25 @@ contract LendingPool {
     //--------------------------------------------------------------------
     /** OWNER FUNCTIONS */
 
-    function setPaused(uint256 _state) external {
-        if (msg.sender != manager) revert OnlyManager();
-        if (_state == 1 || _state == 2) paused = _state;
-    }
-
-    function addSupportedToken(address token, address priceFeed) external {
-        if (msg.sender != manager) revert OnlyManager();
+    function addSupportedToken(
+        address token,
+        address priceFeed,
+        InterestRateParams memory params
+    ) external onlyOwner {
         if (supportedTokens[token].supported) revert AlreadySupported(token);
+        if (params.feeToProtocolRate > MAX_PROTOCOL_FEE)
+            revert InvalidFeeAmount(params.feeToProtocolRate);
 
-        supportedTokens[token].daiPriceFeed = priceFeed;
+        supportedTokens[token].usdPriceFeed = priceFeed;
         supportedTokens[token].supported = true;
         supportedTokensList.push(token);
+
+        InterestRateInfo storage _interestRate = vaults[token].interestRateInfo;
+        _interestRate.feeToProtocolRate = params.feeToProtocolRate;
+        _interestRate.optimalUtilization = params.optimalUtilization;
+        _interestRate.baseRate = params.baseRate;
+        _interestRate.slope1 = params.slope1;
+        _interestRate.slope2 = params.slope2;
 
         emit AddSupportedToken(token);
     }
