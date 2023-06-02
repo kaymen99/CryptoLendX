@@ -32,17 +32,23 @@ async function deployERC20Mock() {
 
 async function mintERC20(account, erc20Address, amount) {
   const erc20 = await ethers.getContractAt("IERC20Mock", erc20Address);
-
-  const mint_tx = await erc20
-    .connect(account)
-    .mint(account.address, getAmountInWei(amount));
+  const mint_tx = await erc20.connect(account).mint(account.address, amount);
   await mint_tx.wait(1);
 }
 
 async function approveERC20(account, erc20Address, approvedAmount, spender) {
   const erc20 = await ethers.getContractAt("IERC20Mock", erc20Address);
-
   const tx = await erc20.connect(account).approve(spender, approvedAmount);
+  await tx.wait(1);
+}
+
+async function mintAndapproveERC20(account, erc20Address, amount, spender) {
+  const erc20 = await ethers.getContractAt("IERC20Mock", erc20Address);
+
+  const mint_tx = await erc20.connect(account).mint(account.address, amount);
+  await mint_tx.wait(1);
+
+  const tx = await erc20.connect(account).approve(spender, amount);
   await tx.wait(1);
 }
 
@@ -54,5 +60,6 @@ module.exports = {
   deployERC20Mock,
   mintERC20,
   approveERC20,
+  mintAndapproveERC20,
   moveTime,
 };
