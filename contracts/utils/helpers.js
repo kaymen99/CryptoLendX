@@ -9,6 +9,10 @@ function getAmountFromWei(amount) {
   return Number(ethers.utils.formatUnits(amount.toString(), "ether"));
 }
 
+function round(num) {
+  return Math.round(num * 10) / 10;
+}
+
 async function moveTime(waitingPeriod) {
   await ethers.provider.send("evm_increaseTime", [waitingPeriod]);
   await ethers.provider.send("evm_mine");
@@ -62,4 +66,5 @@ module.exports = {
   approveERC20,
   mintAndapproveERC20,
   moveTime,
+  round,
 };
