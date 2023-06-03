@@ -57,7 +57,13 @@ contract LendingPool is Pausable, Constants {
     event Borrow(address user, address token, uint256 amount, uint256 shares);
     event Repay(address user, address token, uint256 amount, uint256 shares);
     event Withdraw(address user, address token, uint256 amount, uint256 shares);
-    event Liquidated(address user, address liquidator);
+    event Liquidated(
+        address borrower,
+        address liquidator,
+        uint256 repaidAmount,
+        uint256 liquidatedCollateral,
+        uint256 reward
+    );
     event UpdateInterestRate(uint256 elapsedTime, uint64 newInterestRate);
     event AccruedInterest(
         uint64 interestRatePerSec,
@@ -126,51 +132,11 @@ contract LendingPool is Pausable, Constants {
     }
 
     function withdraw(address token, uint256 amount) external {
-        uint256 userShares = userCollateralShares[msg.sender][token];
-        uint256 shares = vaults[token].totalAsset.toShares(amount, false);
-        if (
-            userShares < shares ||
-            IERC20(token).balanceOf(address(this)) < amount
-        ) revert InsufficientBalance();
-
-        _accrueInterest(token);
-
-        unchecked {
-            vaults[token].totalAsset.shares -= uint128(shares);
-            vaults[token].totalAsset.amount -= uint128(amount);
-            userCollateralShares[msg.sender][token] -= shares;
-        }
-
-        _transferERC20(token, address(this), msg.sender, amount);
-
-        if (healthFactor(msg.sender) <= MIN_HEALTH_FACTOR)
-            revert UnderCollateralized();
-
-        emit Withdraw(msg.sender, token, amount, shares);
+        _withdraw(token, amount, false);
     }
 
     function redeem(address token, uint256 shares) external {
-        uint256 userShares = userCollateralShares[msg.sender][token];
-        uint256 amount = vaults[token].totalAsset.toAmount(shares, false);
-        if (
-            userShares < shares ||
-            IERC20(token).balanceOf(address(this)) < amount
-        ) revert InsufficientBalance();
-
-        _accrueInterest(token);
-
-        unchecked {
-            vaults[token].totalAsset.shares -= uint128(shares);
-            vaults[token].totalAsset.amount -= uint128(amount);
-            userCollateralShares[msg.sender][token] = userShares - shares;
-        }
-
-        _transferERC20(token, address(this), msg.sender, amount);
-
-        if (healthFactor(msg.sender) <= MIN_HEALTH_FACTOR)
-            revert UnderCollateralized();
-
-        emit Withdraw(msg.sender, token, amount, shares);
+        _withdraw(token, shares, true);
     }
 
     function liquidate(
@@ -208,6 +174,9 @@ contract LendingPool is Pausable, Constants {
         uint256 liquidationReward;
         {
             // avoid stack too deep error
+            address user = account;
+            address borrowToken = userBorrowToken;
+            address collToken = collateral;
 
             uint256 _userTotalCollateralAmount = _collateralVault
                 .totalAsset
@@ -237,21 +206,31 @@ contract LendingPool is Pausable, Constants {
             }
 
             // Update borrow vault
-            _borrowVault.totalBorrow.shares -= uint128(
+            uint128 repaidBorrowShares = uint128(
                 _borrowVault.totalBorrow.toShares(amountToLiquidate, false)
             );
+            _borrowVault.totalBorrow.shares -= repaidBorrowShares;
             _borrowVault.totalBorrow.amount -= uint128(amountToLiquidate);
 
             // Update collateral vault
-            _collateralVault.totalAsset.shares -= uint128(
+            uint128 liquidatedCollShares = uint128(
                 _collateralVault.totalAsset.toShares(
                     collateralAmountToLiquidate + liquidationReward,
                     false
                 )
             );
+            _collateralVault.totalAsset.shares -= liquidatedCollShares;
             _collateralVault.totalAsset.amount -= uint128(
                 collateralAmountToLiquidate + liquidationReward
             );
+
+            // Update borrower collateral and borrow shares
+            userBorrowShares[user][borrowToken] =
+                borrowShares -
+                repaidBorrowShares;
+            userCollateralShares[user][collToken] =
+                collateralShares -
+                liquidatedCollShares;
         }
 
         // Repay borrowed amount
@@ -274,7 +253,13 @@ contract LendingPool is Pausable, Constants {
         vaults[collateral] = _collateralVault;
         vaults[userBorrowToken] = _borrowVault;
 
-        emit Liquidated(account, msg.sender);
+        emit Liquidated(
+            account,
+            msg.sender,
+            amountToLiquidate,
+            collateralAmountToLiquidate + liquidationReward,
+            liquidationReward
+        );
     }
 
     function accrueInterest(
@@ -415,6 +400,36 @@ contract LendingPool is Pausable, Constants {
 
     //--------------------------------------------------------------------
     /** INTERNAL FUNCTIONS */
+
+    function _withdraw(address token, uint256 amount, bool share) internal {
+        _accrueInterest(token);
+
+        uint256 userShares = userCollateralShares[msg.sender][token];
+        uint256 shares;
+        if (share) {
+            shares = amount;
+            amount = vaults[token].totalAsset.toAmount(shares, false);
+        } else {
+            shares = vaults[token].totalAsset.toShares(amount, false);
+        }
+        if (
+            userShares < shares ||
+            IERC20(token).balanceOf(address(this)) < amount
+        ) revert InsufficientBalance();
+
+        unchecked {
+            vaults[token].totalAsset.shares -= uint128(shares);
+            vaults[token].totalAsset.amount -= uint128(amount);
+            userCollateralShares[msg.sender][token] -= shares;
+        }
+
+        _transferERC20(token, address(this), msg.sender, amount);
+
+        if (healthFactor(msg.sender) <= MIN_HEALTH_FACTOR)
+            revert UnderCollateralized();
+
+        emit Withdraw(msg.sender, token, amount, shares);
+    }
 
     function _accrueInterest(
         address token
