@@ -10,7 +10,10 @@ const {
   mintERC20,
   approveERC20,
   deployAggregatorMock,
+  scaleAmount,
+  normalizeAmount,
   round,
+  moveTime,
 } = require("../utils/helpers");
 
 !developmentChains.includes(network.name)
@@ -50,30 +53,26 @@ const {
         describe("supply()", () => {
           let token1, token2;
           let token1Feed, token2Feed;
-          const suppliedAmount = getAmountInWei(100);
+          const ethSuppliedAmount = getAmountInWei(10); // 10 ETH
+          const wbtcSuppliedAmount = scaleAmount(5, 8); // 5 wBTC
           let beforePoolbalance;
           before(async () => {
             // Deploy Lending Pool contract
             const LendingPool = await ethers.getContractFactory("LendingPool");
             pool = await LendingPool.deploy();
 
-            // Deploy ERC20 mocks contract for testing
-            token1 = await deployERC20Mock();
-            token2 = await deployERC20Mock();
-
-            token1Feed = await deployAggregatorMock(getAmountInWei(100), 18);
-            token2Feed = await deployAggregatorMock(getAmountInWei(300), 18);
+            [token1, token2, token1Feed, token2Feed] = await deployMocks();
           });
           it("should revert if pool is paused", async () => {
             await mintAndapproveERC20(
               user1,
               token1.address,
-              suppliedAmount,
+              ethSuppliedAmount,
               pool.address
             );
 
             await expect(
-              pool.connect(user1).supply(token1.address, suppliedAmount)
+              pool.connect(user1).supply(token1.address, ethSuppliedAmount)
             ).to.be.revertedWithCustomError(pool, "isPaused");
           });
           it("should revert if ERC20 token is not supported", async () => {
@@ -81,7 +80,7 @@ const {
             await pool.connect(owner).setPaused(2);
 
             await expect(
-              pool.connect(user1).supply(token1.address, suppliedAmount)
+              pool.connect(user1).supply(token1.address, ethSuppliedAmount)
             ).to.be.revertedWithCustomError(pool, "TokenNotSupported");
           });
           it("should allow user to supply supported ERC20 tokens", async () => {
@@ -98,29 +97,29 @@ const {
 
             const tx = await pool
               .connect(user1)
-              .supply(token1.address, suppliedAmount);
+              .supply(token1.address, ethSuppliedAmount);
             let txReceipt = await tx.wait(1);
 
             const supplyEvent =
               txReceipt.events[txReceipt.events.length - 1].args;
             expect(supplyEvent.user).to.equal(user1.address);
             expect(supplyEvent.token).to.equal(token1.address);
-            expect(supplyEvent.amount).to.equal(suppliedAmount);
+            expect(supplyEvent.amount).to.equal(ethSuppliedAmount);
           });
           it("should transfer supplied amount to pool", async () => {
             const afterPoolbalance = getAmountFromWei(
               await token1.balanceOf(pool.address)
             );
             expect(afterPoolbalance).to.be.equal(
-              getAmountFromWei(suppliedAmount) + beforePoolbalance
+              getAmountFromWei(ethSuppliedAmount) + beforePoolbalance
             );
           });
           it("should add shares/amount to the token vault", async () => {
             const vault = await pool.getTokenVault(token1.address);
 
-            expect(vault.totalAsset.amount).to.equal(suppliedAmount);
+            expect(vault.totalAsset.amount).to.equal(ethSuppliedAmount);
             // for first supply we have shares == amount
-            expect(vault.totalAsset.shares).to.equal(suppliedAmount);
+            expect(vault.totalAsset.shares).to.equal(ethSuppliedAmount);
           });
           it("should update user collateral balance", async () => {
             const tokenCollateralAmount = (
@@ -129,7 +128,7 @@ const {
                 token1.address
               )
             )[0];
-            expect(tokenCollateralAmount).to.equal(suppliedAmount);
+            expect(tokenCollateralAmount).to.equal(ethSuppliedAmount);
           });
           it("should calculate correct shares to new suppliers", async () => {
             await pool
@@ -141,15 +140,15 @@ const {
               );
 
             // user 2 supplies token2 and borrows token1
-            await mintERC20(user2, token2.address, suppliedAmount);
-            await supply(user2, token2.address, suppliedAmount, pool);
+            await mintERC20(user2, token2.address, wbtcSuppliedAmount);
+            await supply(user2, token2.address, wbtcSuppliedAmount, pool);
+
             // user 2 borrows 50 token1
             await pool
               .connect(user2)
-              .borrow(token1.address, getAmountInWei(50));
+              .borrow(token1.address, getAmountInWei(10));
 
             await hre.network.provider.send("hardhat_mine", ["0x4e20"]);
-
             await pool.connect(user2).accrueInterest(token1.address);
 
             const vault = await pool.getTokenVault(token1.address);
@@ -157,8 +156,9 @@ const {
             const beforeAssetAmount = getAmountFromWei(vault.totalAsset.amount);
 
             // user 3 supplies token1
-            await mintERC20(user3, token1.address, getAmountInWei(150));
-            await supply(user3, token1.address, getAmountInWei(150), pool);
+            const user3Amount = getAmountInWei(20); // 20 ETH
+            await mintERC20(user3, token1.address, user3Amount);
+            await supply(user3, token1.address, user3Amount, pool);
 
             const collateralShares = (
               await pool.getUserTokenCollateralAndBorrow(
@@ -168,11 +168,12 @@ const {
             )[0];
 
             const expectedShares = parseFloat(
-              (150 * beforeAssetShares) / beforeAssetAmount
-            ).toFixed(5);
+              (getAmountFromWei(user3Amount) * beforeAssetShares) /
+                beforeAssetAmount
+            ).toFixed(3);
 
             expect(
-              parseFloat(getAmountFromWei(collateralShares)).toFixed(5)
+              parseFloat(getAmountFromWei(collateralShares)).toFixed(3)
             ).to.be.equal(expectedShares);
           });
         });
@@ -186,11 +187,7 @@ const {
             pool = await LendingPool.deploy();
 
             // Deploy ERC20 mocks contract for testing
-            token1 = await deployERC20Mock();
-            token2 = await deployERC20Mock();
-
-            token1Feed = await deployAggregatorMock(getAmountInWei(100), 18);
-            token2Feed = await deployAggregatorMock(getAmountInWei(300), 18);
+            [token1, token2, token1Feed, token2Feed] = await deployMocks();
 
             // add supported ERC20 tokens
             await pool
@@ -208,7 +205,7 @@ const {
                 interestParams
               );
           });
-          const borrowAmount = getAmountInWei(50);
+          const borrowAmount = getAmountInWei(5); // 5 ETH
           let beforeBorrowerBalance;
           it("should revert if pool is paused", async () => {
             await expect(
@@ -225,15 +222,15 @@ const {
           });
           it("should allow user to borrow supported ERC20 tokens", async () => {
             // user 1 supplies token1
-            await mintERC20(user1, token1.address, getAmountInWei(200));
-            await supply(user1, token1.address, getAmountInWei(200), pool);
+            await mintERC20(user1, token1.address, getAmountInWei(30)); // 30 ETH
+            await supply(user1, token1.address, getAmountInWei(30), pool);
 
             beforeBorrowerBalance = getAmountFromWei(
               await token1.balanceOf(user2.address)
             );
 
             // user 2 supplies token2
-            const amount = getAmountInWei(100);
+            const amount = scaleAmount(10, 8); // 10 BTC
             await mintERC20(user2, token2.address, amount);
             await supply(user2, token2.address, amount, pool);
 
@@ -275,11 +272,15 @@ const {
           });
           it("should calculate correct shares for new borrowers", async () => {
             // user 2 supplies token2 and borrows token1
-            const suppliedAmount = getAmountInWei(40);
+            const suppliedAmount = scaleAmount(1.5, 8); //1.5 WBTC
             await mintERC20(user3, token2.address, suppliedAmount);
             await supply(user3, token2.address, suppliedAmount, pool);
 
             await hre.network.provider.send("hardhat_mine", ["0x4e20"]);
+
+            // update chainlink price feed to avoid Invalid_Price error
+            await token1Feed.updateAnswer(scaleAmount(2000, 8)); //1 ETH = 2000$
+            await token2Feed.updateAnswer(scaleAmount(30000, 8)); //1 WBTC = 30000$
             await pool.connect(user2).accrueInterest(token1.address);
 
             // user3 borrows 10 token1
@@ -313,7 +314,7 @@ const {
           it("should revert if borrower is not healthy", async () => {
             // user3 tries to borrow more token1
             await expect(
-              pool.connect(user3).borrow(token1.address, getAmountInWei(100))
+              pool.connect(user3).borrow(token1.address, getAmountInWei(10))
             ).to.be.revertedWithCustomError(pool, "BorrowNotAllowed");
           });
         });
@@ -329,11 +330,7 @@ const {
             await pool.connect(owner).setPaused(2);
 
             // Deploy ERC20 mocks contract for testing
-            token1 = await deployERC20Mock();
-            token2 = await deployERC20Mock();
-
-            token1Feed = await deployAggregatorMock(getAmountInWei(100), 18);
-            token2Feed = await deployAggregatorMock(getAmountInWei(300), 18);
+            [token1, token2, token1Feed, token2Feed] = await deployMocks();
 
             // add supported ERC20 tokens
             await pool
@@ -352,18 +349,18 @@ const {
               );
 
             // user 1 supplies token1
-            await mintERC20(user1, token1.address, getAmountInWei(200));
-            await supply(user1, token1.address, getAmountInWei(200), pool);
+            await mintERC20(user1, token1.address, getAmountInWei(20)); // 20 ETH
+            await supply(user1, token1.address, getAmountInWei(20), pool);
 
             // user 2 supplies token2
-            const amount = getAmountInWei(100);
+            const amount = scaleAmount(10, 8); // 10 ETH
             await mintERC20(user2, token2.address, amount);
             await supply(user2, token2.address, amount, pool);
 
             // user2 borrows token 1
             await pool
               .connect(user2)
-              .borrow(token1.address, getAmountInWei(50));
+              .borrow(token1.address, getAmountInWei(20));
           });
           let beforePoolbalance,
             beforePoolBorrowShares,
@@ -388,7 +385,7 @@ const {
               )[1]
             );
 
-            repaidAmount = getAmountInWei(35);
+            repaidAmount = getAmountInWei(15);
             repaidShares = await pool.amountToShares(
               token1.address,
               repaidAmount,
@@ -497,11 +494,7 @@ const {
             await pool.connect(owner).setPaused(2);
 
             // Deploy ERC20 mocks contract for testing
-            token1 = await deployERC20Mock();
-            token2 = await deployERC20Mock();
-
-            token1Feed = await deployAggregatorMock(getAmountInWei(100), 18);
-            token2Feed = await deployAggregatorMock(getAmountInWei(300), 18);
+            [token1, token2, token1Feed, token2Feed] = await deployMocks();
 
             // add supported ERC20 tokens
             await pool
@@ -520,26 +513,26 @@ const {
               );
 
             // user 1 supplies token1
-            await mintERC20(user1, token1.address, getAmountInWei(200));
-            await supply(user1, token1.address, getAmountInWei(200), pool);
+            await mintERC20(user1, token1.address, getAmountInWei(40));
+            await supply(user1, token1.address, getAmountInWei(40), pool);
           });
           it("should revert if withdraw amount is greater than supply balance", async () => {
             await expect(
-              pool.connect(user1).withdraw(token1.address, getAmountInWei(250))
+              pool.connect(user1).withdraw(token1.address, getAmountInWei(50))
             ).to.be.revertedWithCustomError(pool, "InsufficientBalance");
           });
           it("should revert if insufficient token balance in pool", async () => {
             // user 2 supplies token2
-            const amount = getAmountInWei(100);
+            const amount = getAmountInWei(5);
             await mintERC20(user2, token2.address, amount);
             await supply(user2, token2.address, amount, pool);
 
             // user2 borrows token 1
             await pool
               .connect(user2)
-              .borrow(token1.address, getAmountInWei(60));
+              .borrow(token1.address, getAmountInWei(10));
             await expect(
-              pool.connect(user1).withdraw(token1.address, getAmountInWei(200))
+              pool.connect(user1).withdraw(token1.address, getAmountInWei(40))
             ).to.be.revertedWithCustomError(pool, "InsufficientBalance");
           });
           let beforeUserbalance,
@@ -565,14 +558,14 @@ const {
               )[0]
             );
 
-            withdrawAmount = getAmountInWei(100);
+            withdrawAmount = getAmountInWei(10);
             withdrawnShares = await pool.amountToShares(
               token1.address,
               withdrawAmount,
               false
             );
 
-            // user1 withdraws 100 token1
+            // user1 withdraws 10 token1
             const tx = await pool
               .connect(user1)
               .withdraw(token1.address, withdrawAmount);
@@ -619,11 +612,11 @@ const {
             // user1 borrows token2
             await pool
               .connect(user1)
-              .borrow(token2.address, getAmountInWei(20));
+              .borrow(token2.address, scaleAmount(1.5, 8));
 
             // user1 tries to withdraw supplied token1
             await expect(
-              pool.connect(user1).withdraw(token1.address, getAmountInWei(40))
+              pool.connect(user1).withdraw(token1.address, getAmountInWei(10))
             ).to.be.revertedWithCustomError(pool, "UnderCollateralized");
           });
         });
@@ -639,11 +632,7 @@ const {
             await pool.connect(owner).setPaused(2);
 
             // Deploy ERC20 mocks contract for testing
-            token1 = await deployERC20Mock();
-            token2 = await deployERC20Mock();
-
-            token1Feed = await deployAggregatorMock(getAmountInWei(100), 18);
-            token2Feed = await deployAggregatorMock(getAmountInWei(300), 18);
+            [token1, token2, token1Feed, token2Feed] = await deployMocks();
 
             // add supported ERC20 tokens
             await pool
@@ -662,8 +651,8 @@ const {
               );
 
             // user 1 supplies token1
-            await mintERC20(user1, token1.address, getAmountInWei(200));
-            await supply(user1, token1.address, getAmountInWei(200), pool);
+            await mintERC20(user1, token1.address, getAmountInWei(80));
+            await supply(user1, token1.address, getAmountInWei(80), pool);
           });
           it("should revert if withdrawn shares are greater than supplied shares", async () => {
             const userAssetShares = getAmountFromWei(
@@ -681,7 +670,7 @@ const {
           });
           it("should revert if insufficient token balance in pool", async () => {
             // user 2 supplies token2
-            const amount = getAmountInWei(100);
+            const amount = getAmountInWei(5);
             await mintERC20(user2, token2.address, amount);
             await supply(user2, token2.address, amount, pool);
 
@@ -694,7 +683,7 @@ const {
             // user2 borrows token 1
             await pool
               .connect(user2)
-              .borrow(token1.address, getAmountInWei(60));
+              .borrow(token1.address, getAmountInWei(10));
             await expect(
               pool.connect(user1).redeem(token1.address, userAssetShares)
             ).to.be.revertedWithCustomError(pool, "InsufficientBalance");
@@ -705,7 +694,7 @@ const {
             beforeUserAssetShares,
             withdrawnAmount,
             withdrawnShares;
-          it("should allow user to withdraw supplied amount", async () => {
+          it("should allow user to redeem shares", async () => {
             const vault = await pool.getTokenVault(token1.address);
             beforePoolAssetShares = getAmountFromWei(vault.totalAsset.shares);
             beforePoolAssetAmount = getAmountFromWei(vault.totalAsset.amount);
@@ -722,7 +711,7 @@ const {
               )[0]
             );
 
-            withdrawnShares = getAmountInWei(100);
+            withdrawnShares = getAmountInWei(10);
             withdrawnAmount = await pool.sharesToAmount(
               token1.address,
               withdrawnShares,
@@ -775,13 +764,11 @@ const {
           });
           it("should revert if user becomes not solvent", async () => {
             // user1 borrows token2
-            await pool
-              .connect(user1)
-              .borrow(token2.address, getAmountInWei(20));
+            await pool.connect(user1).borrow(token2.address, scaleAmount(3, 8));
 
             // user1 tries to withdraw supplied token1
             await expect(
-              pool.connect(user1).withdraw(token1.address, getAmountInWei(30))
+              pool.connect(user1).redeem(token1.address, getAmountInWei(30))
             ).to.be.revertedWithCustomError(pool, "UnderCollateralized");
           });
         });
@@ -797,11 +784,7 @@ const {
             await pool.connect(owner).setPaused(2);
 
             // Deploy ERC20 mocks contract for testing
-            token1 = await deployERC20Mock();
-            token2 = await deployERC20Mock();
-
-            token1Feed = await deployAggregatorMock(getAmountInWei(100), 18);
-            token2Feed = await deployAggregatorMock(getAmountInWei(300), 18);
+            [token1, token2, token1Feed, token2Feed] = await deployMocks();
 
             // add supported ERC20 tokens
             await pool
@@ -824,14 +807,14 @@ const {
             await supply(user1, token1.address, getAmountInWei(200), pool);
 
             // user 2 supplies token2
-            const amount = getAmountInWei(60);
+            const amount = scaleAmount(10, 8);
             await mintERC20(user2, token2.address, amount);
             await supply(user2, token2.address, amount, pool);
 
             // user2 borrows token 1
             await pool
               .connect(user2)
-              .borrow(token1.address, getAmountInWei(120));
+              .borrow(token1.address, getAmountInWei(100));
           });
           it("should revert if borrower is solvent", async () => {
             await expect(
@@ -855,8 +838,8 @@ const {
             beforeUserBorrowShares1,
             beforeUserAssetShares2;
           it("should allow liquidator to liquidate unsolvant borrower", async () => {
-            // simulate decrease in token2 price 300 -> 240
-            await token2Feed.updateAnswer(getAmountInWei(240));
+            // simulate decrease in token2 price
+            await token2Feed.updateAnswer(scaleAmount(24000, 8)); // 1 BTC = 24000$
 
             // user2 health factor is less than 1
             expect(await pool.healthFactor(user2.address)).to.be.lessThan(
@@ -871,8 +854,8 @@ const {
             beforePoolBorrowAmount = getAmountFromWei(vault.totalBorrow.amount);
             beforePoolBorrowShares = getAmountFromWei(vault.totalBorrow.shares);
             vault = await pool.getTokenVault(token2.address);
-            beforePoolAssetAmount = getAmountFromWei(vault.totalAsset.amount);
-            beforePoolAssetShares = getAmountFromWei(vault.totalAsset.shares);
+            beforePoolAssetAmount = normalizeAmount(vault.totalAsset.amount, 8);
+            beforePoolAssetShares = normalizeAmount(vault.totalAsset.shares, 8);
 
             const userShares1 = await pool.getUserTokenCollateralAndBorrow(
               user2.address,
@@ -884,7 +867,7 @@ const {
               user2.address,
               token2.address
             );
-            beforeUserAssetShares2 = getAmountFromWei(userShares2[0]);
+            beforeUserAssetShares2 = normalizeAmount(userShares2[0], 8);
 
             const liquidatedAmount = getAmountInWei(50);
             await mintAndapproveERC20(
@@ -922,19 +905,21 @@ const {
           });
           it("should transfer liquidated collateral to liquidator", async () => {
             const beforeLiquidatorBalance = 0;
-            const afterLiquidatorBalance = getAmountFromWei(
-              await token2.balanceOf(user3.address)
+            const afterLiquidatorBalance = normalizeAmount(
+              await token2.balanceOf(user3.address),
+              8
             );
             expect(afterLiquidatorBalance).to.be.equal(
               beforeLiquidatorBalance +
-                getAmountFromWei(totalReceivedCollateral)
+                normalizeAmount(totalReceivedCollateral, 8)
             );
           });
           it("should update asset shares/amount of the token vault", async () => {
             const vault = await pool.getTokenVault(token2.address);
 
-            expect(getAmountFromWei(vault.totalAsset.amount)).to.equal(
-              beforePoolAssetAmount - getAmountFromWei(totalReceivedCollateral)
+            expect(normalizeAmount(vault.totalAsset.amount, 8)).to.equal(
+              beforePoolAssetAmount -
+                normalizeAmount(totalReceivedCollateral, 8)
             );
           });
           it("should update borrow shares/amount of the token vault", async () => {
@@ -962,22 +947,144 @@ const {
             );
           });
           it("should update borrower collateral shares", async () => {
-            const afterUserAssetShares2 = getAmountFromWei(
+            const afterUserAssetShares2 = normalizeAmount(
               (
                 await pool.getUserTokenCollateralAndBorrow(
                   user2.address,
                   token2.address
                 )
-              )[0]
+              )[0],
+              8
             );
             const liquidatedCollShares =
-              (getAmountFromWei(totalReceivedCollateral) *
+              (normalizeAmount(totalReceivedCollateral, 8) *
                 beforePoolAssetShares) /
               beforePoolAssetAmount;
             totalReceivedCollateral *
               expect(afterUserAssetShares2).to.equal(
                 beforeUserAssetShares2 - liquidatedCollShares
               );
+          });
+        });
+        describe("getPrice()", () => {
+          let token1, token2;
+          let token1Feed, token2Feed;
+          before(async () => {
+            // Deploy Lending Pool contract
+            const LendingPool = await ethers.getContractFactory("LendingPool");
+            pool = await LendingPool.deploy();
+
+            // unpause pool
+            await pool.connect(owner).setPaused(2);
+
+            // Deploy ERC20 mocks contract for testing
+            [token1, token2, token1Feed, token2Feed] = await deployMocks();
+
+            // add supported ERC20 tokens
+            await pool
+              .connect(owner)
+              .addSupportedToken(
+                token1.address,
+                token1Feed.address,
+                interestParams
+              );
+            await pool
+              .connect(owner)
+              .addSupportedToken(
+                token2.address,
+                token2Feed.address,
+                interestParams
+              );
+          });
+          it("should return correct price", async () => {
+            const price1 = await pool.getTokenPrice(token1.address);
+            let expected_price1 = (await token1Feed.latestRoundData())[1];
+            expected_price1 = scaleAmount(expected_price1, 10); // scale by 10^10
+            expect(Number(price1)).to.be.equal(expected_price1);
+
+            const price2 = await pool.getTokenPrice(token2.address);
+            let expected_price2 = (await token2Feed.latestRoundData())[1];
+            expected_price2 = scaleAmount(expected_price2, 10); // scale by 10^10
+            expect(Number(price2)).to.be.equal(expected_price2);
+          });
+          it("should return price scaled by 18 decimals", async () => {
+            const token = await deployERC20Mock("USD coinbase", "USDC", 6);
+            const tokenFeed = await deployAggregatorMock(scaleAmount(1, 8), 8); // 1USDC = 1$
+            await pool
+              .connect(owner)
+              .addSupportedToken(
+                token.address,
+                tokenFeed.address,
+                interestParams
+              );
+            let price = await pool.getTokenPrice(token.address);
+            const expected_price = getAmountInWei(1); // 1e18
+            expect(price).to.be.equal(expected_price);
+          });
+          it("should revert if price is outdated", async () => {
+            const period = 3 * 24 * 3600; // 3h
+            await moveTime(period);
+            await expect(
+              pool.getTokenPrice(token1.address)
+            ).to.be.revertedWithCustomError(pool, "InvalidPrice");
+          });
+          it("should revert if price is below zero", async () => {
+            await token1Feed.updateAnswer(0);
+            await expect(
+              pool.getTokenPrice(token1.address)
+            ).to.be.revertedWithCustomError(pool, "InvalidPrice");
+          });
+        });
+        describe("getAmountInUSD()", () => {
+          let token1, token2;
+          let token1Feed, token2Feed;
+          before(async () => {
+            // Deploy Lending Pool contract
+            const LendingPool = await ethers.getContractFactory("LendingPool");
+            pool = await LendingPool.deploy();
+
+            // unpause pool
+            await pool.connect(owner).setPaused(2);
+
+            // Deploy ERC20 mocks contract for testing
+            [token1, token2, token1Feed, token2Feed] = await deployMocks();
+
+            // add supported ERC20 tokens
+            await pool
+              .connect(owner)
+              .addSupportedToken(
+                token1.address,
+                token1Feed.address,
+                interestParams
+              );
+            await pool
+              .connect(owner)
+              .addSupportedToken(
+                token2.address,
+                token2Feed.address,
+                interestParams
+              );
+          });
+          it("should return correct amount in USD", async () => {
+            const ethAmount = getAmountInWei(10); // 10 ETH
+            const ethToUSDAmount = await pool.getAmountInUSD(
+              token1.address,
+              ethAmount
+            );
+            let price1 = (await token1Feed.latestRoundData())[1];
+            scaled_price1 = scaleAmount(price1, 10); // scale by 10^10
+            const expectedUsdAmount1 = scaled_price1 * 10;
+            expect(Number(ethToUSDAmount)).to.be.equal(expectedUsdAmount1);
+
+            const wbtcAmount = getAmountInWei(5); // 5 BTC
+            const wbtcToUSDAmount = await pool.getAmountInUSD(
+              token1.address,
+              wbtcAmount
+            );
+            let price2 = (await token1Feed.latestRoundData())[1];
+            scaled_price2 = scaleAmount(price2, 10); // scale by 10^10
+            const expectedUsdAmount2 = scaled_price2 * 5;
+            expect(Number(wbtcToUSDAmount)).to.be.equal(expectedUsdAmount2);
           });
         });
       });
@@ -1000,11 +1107,12 @@ const {
         });
         it("only owner should be allowed to add supported tokens", async () => {
           // Deploy ERC20 mocks contract for testing
-          const token1 = await deployERC20Mock();
+          const token1 = await deployERC20Mock("ether", "ETH", 18);
+
           const token1Feed = await deployAggregatorMock(
-            getAmountInWei(100),
-            18
-          );
+            scaleAmount(2000, 8),
+            8
+          ); // 1ETH = 2000$
 
           // Non owner tries to add new token
           await expect(
@@ -1034,4 +1142,14 @@ async function supply(user, tokenAddress, amount, pool) {
   let txReceipt = await tx.wait(1);
 
   return txReceipt;
+}
+
+async function deployMocks() {
+  const token1 = await deployERC20Mock("ether", "ETH", 18);
+  const token2 = await deployERC20Mock("wrapped Bitcoin", "wBTC", 8);
+
+  const token1Feed = await deployAggregatorMock(scaleAmount(2000, 8), 8); // 1ETH = 2000$
+  const token2Feed = await deployAggregatorMock(scaleAmount(30000, 8), 8); // 1BTC = 30000$
+
+  return [token1, token2, token1Feed, token2Feed];
 }
