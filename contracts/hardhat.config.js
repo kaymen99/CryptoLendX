@@ -1,4 +1,5 @@
 require("dotenv").config();
+require("hardhat-contract-sizer");
 require("@nomiclabs/hardhat-etherscan");
 require("@nomicfoundation/hardhat-chai-matchers");
 require("hardhat-gas-reporter");
@@ -13,14 +14,7 @@ task("accounts", "Prints the list of accounts", async (taskArgs, hre) => {
   }
 });
 
-// You need to export an object to set up your config
-// Go to https://hardhat.org/config/ to learn more
-
-/**
- * @type import('hardhat/config').HardhatUserConfig
- */
-
-const RINKEBY_ETHERSCAN_API_KEY = process.env.RINKEBY_ETHERSCAN_API_KEY;
+const POLYGONSCAN_API_KEY = process.env.POLYGONSCAN_API_KEY;
 const POLYGON_RPC_URL = process.env.POLYGON_RPC_URL;
 const MUMBAI_RPC_URL = process.env.MUMBAI_RPC_URL;
 const MAINNET_FORK_RPC_URL = process.env.MAINNET_FORK_ALCHEMY_URL;
@@ -29,7 +23,13 @@ module.exports = {
   solidity: {
     compilers: [
       {
-        version: "0.8.10",
+        version: "0.8.18",
+        settings: {
+          optimizer: {
+            enabled: true,
+            runs: 200,
+          },
+        },
       },
     ],
   },
@@ -40,9 +40,6 @@ module.exports = {
     //     blockNumber: 15465300
     //   }
     // },
-    localhost: {
-      chainId: 31337,
-    },
     ganache: {
       chainId: 1337,
       url: "http://127.0.0.1:7545",
@@ -67,7 +64,7 @@ module.exports = {
   },
   etherscan: {
     apiKey: {
-      rinkeby: RINKEBY_ETHERSCAN_API_KEY,
+      rinkeby: POLYGONSCAN_API_KEY,
     },
   },
   mocha: {
