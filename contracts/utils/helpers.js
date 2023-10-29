@@ -5,8 +5,16 @@ const developmentChains = ["hardhat", "localhost", "ganache"];
 function getAmountInWei(amount) {
   return ethers.utils.parseEther(amount.toString(), "ether");
 }
+
 function getAmountFromWei(amount) {
   return Number(ethers.utils.formatUnits(amount.toString(), "ether"));
+}
+
+function scaleAmount(amount, decimals) {
+  return amount * 10 ** decimals;
+}
+function normalizeAmount(amount, decimals) {
+  return amount / 10 ** decimals;
 }
 
 function round(num) {
@@ -26,9 +34,9 @@ async function deployAggregatorMock(price, decimals) {
   return mockContract;
 }
 
-async function deployERC20Mock() {
-  const Mock = await hre.ethers.getContractFactory("ERC20Mock");
-  const mockContract = await Mock.deploy();
+async function deployERC20Mock(name, symbol, decimals) {
+  const Mock = await hre.ethers.getContractFactory("ERC20MockWithDecimals");
+  const mockContract = await Mock.deploy(name, symbol, decimals);
   await mockContract.deployed();
 
   return mockContract;
@@ -58,6 +66,8 @@ async function mintAndapproveERC20(account, erc20Address, amount, spender) {
 
 module.exports = {
   developmentChains,
+  normalizeAmount,
+  scaleAmount,
   getAmountFromWei,
   getAmountInWei,
   deployAggregatorMock,
