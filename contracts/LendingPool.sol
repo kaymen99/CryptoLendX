@@ -48,6 +48,7 @@ contract LendingPool is Pausable, NFTCollateral {
     error InvalidReserveRatio(uint256 ratio);
     error NoLiquidateWarn();
     error WarningDelayHasNotPassed();
+    error MustRepayMoreDebt();
     error LiquidatorDelayHasNotPassed();
     error EmptyArray();
     error ArrayMismatch();
@@ -95,7 +96,9 @@ contract LendingPool is Pausable, NFTCollateral {
         address liquidator,
         address borrower,
         address nftAddress,
-        uint256 tokenId
+        uint256 tokenId,
+        uint256 totalRepayDebt,
+        uint256 nftBuyPrice
     );
     event NewVaultSetup(address token, PoolStructs.VaultSetupParams params);
 
@@ -464,8 +467,8 @@ contract LendingPool is Pausable, NFTCollateral {
         address nftAddress,
         uint256 tokenId
     ) external {
-        if (healthFactor(account) >= MIN_HEALTH_FACTOR)
-            revert BorrowerIsSolvant();
+        if (healthFactor(account) < MIN_HEALTH_FACTOR)
+            revert BelowHeathFactor();
         delete nftLiquidationWarning[account][nftAddress][tokenId];
         emit LiquidateNFTStopped(account, nftAddress, tokenId);
     }
@@ -487,10 +490,8 @@ contract LendingPool is Pausable, NFTCollateral {
         if (repayTokens.length != repayAmounts.length) revert ArrayMismatch();
         canLiquidateNFT(account, nftAddress, tokenId);
 
-        uint256 nftCollateralValue = getUserNFTCollateralValue(nftAddress);
+        uint256 totalDebtValue = getUserTotalBorrow(account);
         uint256 nftFloorPrice = getTokenPrice(nftAddress);
-        bool isLastNFT = nftCollateralValue > nftFloorPrice ? false : true;
-
         uint256 totalRepaidDebtValue;
         {
             // avoid stack too deep
@@ -509,15 +510,8 @@ contract LendingPool is Pausable, NFTCollateral {
                 vaults[token].totalBorrow.shares -= uint128(borrowShares);
                 vaults[token].totalBorrow.amount -= uint128(amount);
 
-                if (isLastNFT) {
-                    // this is last collateral of borrower
-                    // we must remove all borrower debt to avoid bad debt accrual
-                    // protocol will incur losses if totalBorrowValue > nftFloorPrice
-                    userShares[borrower][token].borrow = 0;
-                } else {
-                    // update borrower shares
-                    userShares[borrower][token].borrow -= uint128(borrowShares);
-                }
+                // update borrower shares
+                userShares[borrower][token].borrow -= uint128(borrowShares);
 
                 // increase total debt repaid value
                 totalRepaidDebtValue += getAmountInUSD(token, amount);
@@ -525,41 +519,63 @@ contract LendingPool is Pausable, NFTCollateral {
                     ++i;
                 }
             }
+
+            // must repay at least debt equivalent of half NFT value
+            if (
+                totalDebtValue > nftFloorPrice &&
+                totalRepaidDebtValue <
+                (nftFloorPrice * DEFAULT_LIQUIDATION_CLOSE_FACTOR) / BPS
+            ) revert MustRepayMoreDebt();
         }
 
+        uint256 nftBuyPrice;
         {
             // avoid stack too deep
             address borrower = account;
             // liquidator will pay less to buy NFT
             // must deduct repaidDebtValue and liquidator bonus from NFT price
             uint256 totalLiquidatorDiscount = (totalRepaidDebtValue *
-                (BPS + LIQUIDATION_REWARD)) / BPS;
-            uint256 nftBuyAmountInUSD = nftFloorPrice - totalLiquidatorDiscount;
+                (BPS + NFT_LIQUIDATION_DISCOUNT)) / BPS;
+            nftBuyPrice = nftFloorPrice - totalLiquidatorDiscount;
 
             address DAI = supportedERC20s[0];
             // but NFT with discounted price, DAI is used for payment
-            DAI.transferERC20(msg.sender, address(this), nftBuyAmountInUSD);
+            DAI.transferERC20(msg.sender, address(this), nftBuyPrice);
 
             // supply remaining DAI onbehalf of borrower
             uint256 shares = vaults[DAI].totalAsset.toShares(
-                nftBuyAmountInUSD,
+                nftBuyPrice,
                 false
             );
             vaults[DAI].totalAsset.shares += uint128(shares);
-            vaults[DAI].totalAsset.amount += uint128(nftBuyAmountInUSD);
+            vaults[DAI].totalAsset.amount += uint128(nftBuyPrice);
             userShares[borrower][DAI].collateral += shares;
         }
 
         // transfer NFT to liquidator
         _withdrawNFT(account, msg.sender, nftAddress, tokenId);
 
-        // liquidation must drive borrower HF above MIN_HEALTH_FACTOR
-        if (healthFactor(account) < MIN_HEALTH_FACTOR)
-            revert BelowHeathFactor();
-
-        emit NFTLiquidated(msg.sender, account, nftAddress, tokenId);
+        emit NFTLiquidated(
+            msg.sender,
+            account,
+            nftAddress,
+            tokenId,
+            totalRepaidDebtValue,
+            nftBuyPrice
+        );
     }
 
+    /**
+     * @dev Checks if an NFT can be liquidated.
+     * @dev can be liquidated when:
+     * borrower must be below min health factor.
+     * liquidation warning must have been emitted.
+     * liquidation warning delay gas passed.
+     * liquidator that triggered the warning will have 5 minutes to liquidate after that anyone will be able to liquidate NFT.
+     * @param account The address of the account.
+     * @param nftAddress The address of the NFT contract.
+     * @param tokenId The ID of the NFT.
+     */
     function canLiquidateNFT(
         address account,
         address nftAddress,
@@ -570,7 +586,7 @@ contract LendingPool is Pausable, NFTCollateral {
         PoolStructs.LiquidateWarn storage warning = nftLiquidationWarning[
             account
         ][nftAddress][tokenId];
-        if (warning.liquidator != address(0)) revert NoLiquidateWarn();
+        if (warning.liquidator == address(0)) revert NoLiquidateWarn();
         if (block.timestamp <= warning.liquidationTimestamp)
             revert WarningDelayHasNotPassed();
         if (
@@ -584,6 +600,10 @@ contract LendingPool is Pausable, NFTCollateral {
                         Getters functions
     //////////////////////////////////////////////////////////////*/
 
+    /**
+     * @dev Returns the total tokens collateral, total NFTs collateral, and total borrowed values in USD for a user.
+     * @param user The address of the user.
+     */
     function getUserData(
         address user
     )
@@ -592,14 +612,18 @@ contract LendingPool is Pausable, NFTCollateral {
         returns (
             uint256 totalTokenCollateral,
             uint256 totalNFTCollateral,
-            uint256 totalBorrow
+            uint256 totalBorrowValue
         )
     {
         totalTokenCollateral = getUserTotalTokenCollateral(user);
         totalNFTCollateral = getUserNFTCollateralValue(user);
-        totalBorrow = getUserTotalBorrow(user);
+        totalBorrowValue = getUserTotalBorrow(user);
     }
 
+    /**
+     * @dev Calculates the total USD value of all tokens collateral for a user.
+     * @param user The address of the user.
+     */
     function getUserTotalTokenCollateral(
         address user
     ) public view returns (uint256 totalValueUSD) {
@@ -619,6 +643,11 @@ contract LendingPool is Pausable, NFTCollateral {
         }
     }
 
+    /**
+     * @dev Calculates the total USD value of all NFTs collateral for a user.
+     * @param user The address of the user.
+     */
+
     function getUserNFTCollateralValue(
         address user
     ) public view returns (uint256 totalValueUSD) {
@@ -636,6 +665,10 @@ contract LendingPool is Pausable, NFTCollateral {
         }
     }
 
+    /**
+     * @dev Calculates the total borrowed USD value for a user.
+     * @param user The address of the user.
+     */
     function getUserTotalBorrow(
         address user
     ) public view returns (uint256 totalValueUSD) {
@@ -655,6 +688,11 @@ contract LendingPool is Pausable, NFTCollateral {
         }
     }
 
+    /**
+     * @dev Returns the collateral and borrow shares for a specific token and user.
+     * @param user The address of the user.
+     * @param token The address of the token.
+     */
     function getUserTokenCollateralAndBorrow(
         address user,
         address token
@@ -667,6 +705,10 @@ contract LendingPool is Pausable, NFTCollateral {
         tokenBorrowShare = userShares[user][token].borrow;
     }
 
+    /**
+     * @dev Calculates the health factor of a user.
+     * @param user The address of the user.
+     */
     function healthFactor(address user) public view returns (uint256 factor) {
         (
             uint256 totalTokenCollateral,
@@ -684,6 +726,11 @@ contract LendingPool is Pausable, NFTCollateral {
             totalBorrowValue;
     }
 
+    /**
+     * @dev Converts the given amount of a token to its equivalent value in USD.
+     * @param token The address of the token.
+     * @param amount The amount of the token.
+     */
     function getAmountInUSD(
         address token,
         uint256 amount
@@ -695,18 +742,22 @@ contract LendingPool is Pausable, NFTCollateral {
         value = (amountIn18Decimals * price) / PRECISION;
     }
 
+    /**
+     * @dev Obtain all informations about the token vault.
+     * @param token The address of the token.
+     */
     function getTokenVault(
         address token
     ) public view returns (PoolStructs.TokenVault memory vault) {
         vault = vaults[token];
     }
 
-    function getVaultInfo(
-        address token
-    ) external view returns (PoolStructs.VaultInfo memory) {
-        return vaults[token].vaultInfo;
-    }
-
+    /**
+     * @dev Obtain liquidation warning information for a specific NFT.
+     * @param account The address of the account.
+     * @param nft The address of the NFT.
+     * @param tokenId The ID of the NFT.
+     */
     function getNFTLiquidationWarning(
         address account,
         address nft,
@@ -714,6 +765,13 @@ contract LendingPool is Pausable, NFTCollateral {
     ) external view returns (PoolStructs.LiquidateWarn memory) {
         return nftLiquidationWarning[account][nft][tokenId];
     }
+
+    /**
+     * @dev Converts the given amount of a token to its equivalent shares.
+     * @param token The address of the token.
+     * @param amount The amount of the token.
+     * @param isAsset Boolean indicating whether the amount is asset or borrow.
+     */
 
     function amountToShares(
         address token,
@@ -727,6 +785,12 @@ contract LendingPool is Pausable, NFTCollateral {
         }
     }
 
+    /**
+     * @dev Converts the given shares of a token to its equivalent amount.
+     * @param token The address of the token.
+     * @param shares The shares of the token.
+     * @param isAsset Boolean indicating whether the amount is asset or borrow.
+     */
     function sharesToAmount(
         address token,
         uint256 shares,

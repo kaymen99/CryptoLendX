@@ -12,6 +12,12 @@ abstract contract Constants {
     uint256 internal constant DEFAULT_LIQUIDATION_CLOSE_FACTOR = 5e4; // 50%
     uint256 internal constant LIQUIDATION_REWARD = 5e3; // 5%
 
+    uint256 internal constant NFT_LIQUIDATION_DISCOUNT = 1e4; // 10%
+    // delay given to insolvent borrower for repaying debt to avoid NFT liquidation
+    uint256 internal constant NFT_WARNING_DELAY = 2 hours;
+    // delay given to liquidator (that triggered the liquidation warning) to liquidate the NFT, before allowing anyone to liquidate the NFT
+    uint256 internal constant NFT_LIQUIDATOR_DELAY = 5 minutes;
+
     // Default Interest Rate (if borrows = 0)
     uint64 internal constant DEFAULT_INTEREST = 158247046; // 0.5% annual rate 1e18 precision
 
@@ -20,9 +26,4 @@ abstract contract Constants {
     uint256 internal constant MAX_PROTOCOL_FEE = 1e4; // 10%
 
     uint256 public constant BLOCKS_PER_YEAR = 2102400; // Average Ethereum blocks per year
-
-    // delay given to insolvent borrower for repaying debt to avoid NFT liquidation
-    uint256 internal constant NFT_WARNING_DELAY = 2 hours;
-    // delay given to liquidator (that triggered the liquidation warning) to liquidate the NFT, before allowing anyone to liquidate the NFT
-    uint256 internal constant NFT_LIQUIDATOR_DELAY = 5 minutes;
 }

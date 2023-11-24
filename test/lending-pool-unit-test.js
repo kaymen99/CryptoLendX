@@ -1467,8 +1467,424 @@ let vaultInfoParams = {
               ).to.be.revertedWithCustomError(pool, "InvalidNFTLiquidation");
             });
           });
-          describe("stopNFTLiquidation()", () => {});
-          describe("executeNFTLiquidation()", () => {});
+          describe("stopNFTLiquidation()", () => {
+            let tokenId = 1;
+            before(async () => {
+              // Deploy ERC20 and USD price feeds mocks
+              [DAI, WETH, WBTC, daiFeed, wethFeed, wbtcFeed] =
+                await deployTokenMocks();
+
+              // Deploy NFT mock and NFT floor price feeds mock
+              [NFT, nftFloorPriceFeed] = await deployNFTMocks();
+
+              // Deploy Lending Pool contract
+              pool = await deployPool(
+                DAI.target,
+                daiFeed.target,
+                vaultInfoParams
+              );
+
+              // unpause pool
+              await pool
+                .connect(owner)
+                .setPausedStatus(ethers.ZeroAddress, false);
+
+              // add NFT to supported collateral
+              await setupTokenVault(
+                NFT.target,
+                nftFloorPriceFeed.target,
+                TokenType.ERC721,
+                vaultInfoParams,
+                true
+              );
+
+              // add WETH to supported ERC20 tokens
+              await setupTokenVault(
+                WETH.target,
+                wethFeed.target,
+                TokenType.ERC20,
+                vaultInfoParams,
+                true
+              );
+
+              // user3 supplies WETH
+              await mintERC20(user3, WETH.target, getAmountInWei(20)); // 20 ETH
+              await supply(user3, WETH.target, getAmountInWei(20), pool);
+
+              // mint NFT to user1
+              await mintAndapproveNFT(user1, NFT.target, tokenId, pool.target);
+
+              // deposit NFT 1 to pool
+              await pool.connect(user1).depositNFT(NFT.target, tokenId);
+
+              // user1 borrow 3 WETH
+              const borrowAmount = getAmountInWei(3); // 3 WETH
+              await pool.connect(user1).borrow(WETH.target, borrowAmount);
+
+              // simulate decrease in NFT floor price 10000$ -> 7400$
+              await nftFloorPriceFeed.updateAnswer(scaleAmount(7400, 8)); // 1 NFT = 7400$
+
+              // trigger NFT liquidation
+              await pool
+                .connect(user2)
+                .triggerNFTLiquidation(user1.address, NFT.target, tokenId);
+            });
+            it("should revert if borrower is still below min health factor", async () => {
+              await expect(
+                pool
+                  .connect(user1)
+                  .stopNFTLiquidation(user1.address, NFT.target, tokenId)
+              ).to.be.revertedWithCustomError(pool, "BelowHeathFactor");
+            });
+            it("should stop NFT liquidation if borrower is above min health factor", async () => {
+              // borrower repays borrowed amount
+              await approveERC20(
+                user1,
+                WETH.target,
+                getAmountInWei(1),
+                pool.target
+              );
+              await pool.connect(user1).repay(WETH.target, getAmountInWei(1)); // 1 WETH
+
+              expect(
+                await pool.healthFactor(user1.address)
+              ).to.be.greaterThanOrEqual(getAmountInWei(1));
+
+              await expect(
+                pool
+                  .connect(user1)
+                  .stopNFTLiquidation(user1.address, NFT.target, tokenId)
+              )
+                .to.emit(pool, "LiquidateNFTStopped")
+                .withArgs(user1.address, NFT.target, tokenId);
+
+              const [liquidator, liquidationTime] =
+                await pool.getNFTLiquidationWarning(
+                  user1.address,
+                  NFT.target,
+                  tokenId
+                );
+              expect(liquidator).to.be.equal(ethers.ZeroAddress);
+              expect(liquidationTime).to.be.equal(0);
+            });
+          });
+          describe("executeNFTLiquidation()", () => {
+            let tokenId = 1;
+            before(async () => {
+              // Deploy ERC20 and USD price feeds mocks
+              [DAI, WETH, WBTC, daiFeed, wethFeed, wbtcFeed] =
+                await deployTokenMocks();
+
+              // Deploy NFT mock and NFT floor price feeds mock
+              [NFT, nftFloorPriceFeed] = await deployNFTMocks();
+
+              // Deploy Lending Pool contract
+              pool = await deployPool(
+                DAI.target,
+                daiFeed.target,
+                vaultInfoParams
+              );
+
+              // unpause pool
+              await pool
+                .connect(owner)
+                .setPausedStatus(ethers.ZeroAddress, false);
+
+              // add NFT to supported collateral
+              await setupTokenVault(
+                NFT.target,
+                nftFloorPriceFeed.target,
+                TokenType.ERC721,
+                vaultInfoParams,
+                true
+              );
+
+              // add WETH to supported ERC20 tokens
+              await setupTokenVault(
+                WETH.target,
+                wethFeed.target,
+                TokenType.ERC20,
+                vaultInfoParams,
+                true
+              );
+
+              // user3 supplies WETH
+              await mintERC20(user3, WETH.target, getAmountInWei(20)); // 20 ETH
+              await supply(user3, WETH.target, getAmountInWei(20), pool);
+
+              // mint NFT to user1
+              await mintAndapproveNFT(user1, NFT.target, tokenId, pool.target);
+
+              // deposit NFT 1 to pool
+              await pool.connect(user1).depositNFT(NFT.target, tokenId);
+
+              // user1 borrow 3 WETH
+              const borrowAmount = getAmountInWei(3); // 3 WETH
+              await pool.connect(user1).borrow(WETH.target, borrowAmount);
+
+              // simulate decrease in NFT floor price 10000$ -> 7400$
+              await nftFloorPriceFeed.updateAnswer(scaleAmount(7400, 8)); // 1 NFT = 7400$
+            });
+            it("should revert if empty array given as input", async () => {
+              await expect(
+                pool
+                  .connect(user2)
+                  .executeNFTLiquidation(
+                    user1.address,
+                    NFT.target,
+                    tokenId,
+                    [],
+                    [getAmountInWei(10)]
+                  )
+              ).to.be.revertedWithCustomError(pool, "EmptyArray");
+            });
+            it("should revert if mismatch is input arrays length", async () => {
+              await expect(
+                pool
+                  .connect(user2)
+                  .executeNFTLiquidation(
+                    user1.address,
+                    NFT.target,
+                    tokenId,
+                    [WETH.target],
+                    []
+                  )
+              ).to.be.revertedWithCustomError(pool, "ArrayMismatch");
+            });
+            it("should revert if liquidation warning was not triggered", async () => {
+              await expect(
+                pool
+                  .connect(user2)
+                  .executeNFTLiquidation(
+                    user1.address,
+                    NFT.target,
+                    tokenId,
+                    [WETH.target],
+                    [getAmountInWei(5)]
+                  )
+              ).to.be.revertedWithCustomError(pool, "NoLiquidateWarn");
+            });
+            it("should revert if warning delay hasn't paased", async () => {
+              // trigger NFT liquidation
+              await pool
+                .connect(user2)
+                .triggerNFTLiquidation(user1.address, NFT.target, tokenId);
+              // move 1 hour in time
+              await moveTime(3600);
+              await expect(
+                pool
+                  .connect(user2)
+                  .executeNFTLiquidation(
+                    user1.address,
+                    NFT.target,
+                    tokenId,
+                    [WETH.target],
+                    [getAmountInWei(5)]
+                  )
+              ).to.be.revertedWithCustomError(pool, "WarningDelayHasNotPassed");
+            });
+            it("should revert another user try to liquidate before first liquidator delay ends", async () => {
+              // move 1 hour in time
+              await moveTime(3600);
+
+              // update oracle prices to avoid out of date price error
+              await nftFloorPriceFeed.updateAnswer(scaleAmount(7400, 8));
+              await wethFeed.updateAnswer(scaleAmount(2000, 8));
+              await daiFeed.updateAnswer(scaleAmount(1, 8));
+
+              await expect(
+                pool
+                  .connect(randomUser)
+                  .executeNFTLiquidation(
+                    user1.address,
+                    NFT.target,
+                    tokenId,
+                    [WETH.target],
+                    [getAmountInWei(5)]
+                  )
+              ).to.be.revertedWithCustomError(
+                pool,
+                "LiquidatorDelayHasNotPassed"
+              );
+            });
+            let beforeBorrowerHF, afterBorrowerHF;
+            let beforeBorrowerDebtValue, afterBorrowerDebtValue;
+            let beforeBorrowerDAICollateral, afterBorrowerDAICollateral;
+            let beforeLiquidatorDAIBal, afterLiquidatorDAIBal;
+            let actualDebtRepayValue, actualNFTBuyPrice;
+            it("should allow anyone to liquidate if first liquidator delay has passed and NFT was not liquidated", async () => {
+              const amount = getAmountInWei(2);
+              // mint WETH to allow user3 to repay debt
+              await mintAndapproveERC20(
+                user3,
+                WETH.target,
+                amount,
+                pool.target
+              );
+              // mint DAI to allow user3 to buy NFT
+              await mintAndapproveERC20(
+                user3,
+                DAI.target,
+                getAmountInWei(10000),
+                pool.target
+              );
+
+              // move 5 minutes in time
+              await moveTime(5 * 60);
+
+              beforeBorrowerHF = await pool.healthFactor(user1.address);
+              beforeBorrowerDebtValue = await pool.getUserTotalBorrow(
+                user1.address
+              );
+              beforeBorrowerDAICollateral = (
+                await pool.getUserTokenCollateralAndBorrow(
+                  user1.address,
+                  DAI.target
+                )
+              )[0];
+              beforeLiquidatorDAIBal = await DAI.balanceOf(user3.address);
+              pool.on(
+                "NFTLiquidated",
+                (
+                  liquidator,
+                  borrower,
+                  nftAddress,
+                  id,
+                  totalRepayDebt,
+                  nftBuyPrice
+                ) => {
+                  expect(liquidator).to.equal(user3.address);
+                  expect(borrower).to.equal(user1.address);
+                  expect(nftAddress).to.equal(NFT.target);
+                  expect(id).to.equal(tokenId);
+                  actualDebtRepayValue = totalRepayDebt;
+                  actualNFTBuyPrice = nftBuyPrice;
+                }
+              );
+
+              await expect(
+                pool
+                  .connect(user3)
+                  .executeNFTLiquidation(
+                    user1.address,
+                    NFT.target,
+                    tokenId,
+                    [WETH.target],
+                    [amount]
+                  )
+              ).to.emit(pool, "NFTLiquidated");
+            });
+            it("should increase borrower health factor and decrease debt amount", async () => {
+              afterBorrowerHF = await pool.healthFactor(user1.address);
+              afterBorrowerDebtValue = await pool.getUserTotalBorrow(
+                user1.address
+              );
+              expect(afterBorrowerHF).to.be.greaterThan(beforeBorrowerHF);
+              expect(afterBorrowerDebtValue).to.be.lessThan(
+                beforeBorrowerDebtValue
+              );
+            });
+            it("should deposit remaining NFT value to DAI vault on behalf of borrower", async () => {
+              afterBorrowerDAICollateral = (
+                await pool.getUserTokenCollateralAndBorrow(
+                  user1.address,
+                  DAI.target
+                )
+              )[0];
+              expect(afterBorrowerDAICollateral).to.be.equal(
+                beforeBorrowerDAICollateral + actualNFTBuyPrice
+              );
+            });
+            it("should buy NFT with discounted price", async () => {
+              const nftPriceReelPrice = Number(
+                await pool.getTokenPrice(NFT.target)
+              );
+              // should deduce repaid debt value and liquidation bonus
+              const expectedNFTPrice =
+                nftPriceReelPrice - Number(actualDebtRepayValue) * 1.1;
+              expect(Number(actualNFTBuyPrice) / 1e18).to.be.equal(
+                Math.ceil(expectedNFTPrice / 1e18)
+              );
+            });
+            it("should take DAI funds from liquidator to buy NFT and transfer the NFT", async () => {
+              afterLiquidatorDAIBal = await DAI.balanceOf(user3.address);
+              expect(afterLiquidatorDAIBal).to.be.equal(
+                beforeLiquidatorDAIBal - actualNFTBuyPrice
+              );
+              expect(await NFT.ownerOf(tokenId)).to.be.equal(user3.address);
+            });
+            it("should remove liquidated NFT from user NFT deposits", async () => {
+              expect(
+                await pool.hasDepositedNFT(user1.address, NFT.target, tokenId)
+              ).to.be.equal(false);
+              expect(
+                await pool.getDepositedNFTCount(user1.address, NFT.target)
+              ).to.be.equal(0);
+            });
+            it("should revert if borrower increase health factor and become solvent again", async () => {
+              tokenId = 2;
+
+              // update NFT price
+              await nftFloorPriceFeed.updateAnswer(scaleAmount(20000, 8)); // 1 NFT = 20000$
+
+              // mint NFT to user2
+              await mintAndapproveNFT(user2, NFT.target, tokenId, pool.target);
+
+              // deposit NFT 1 to pool
+              await pool.connect(user2).depositNFT(NFT.target, tokenId);
+
+              // user2 borrow 5 WETH
+              const borrowAmount = getAmountInWei(5); // 5 WETH
+              await pool.connect(user2).borrow(WETH.target, borrowAmount);
+
+              // simulate decrease in NFT floor price 20000$ -> 10000$
+              await nftFloorPriceFeed.updateAnswer(scaleAmount(10000, 8)); // 1 NFT = 10000$
+
+              // user3 trigger NFT liquidation
+              await pool
+                .connect(user3)
+                .triggerNFTLiquidation(user2.address, NFT.target, tokenId);
+
+              // move 1 hour in time
+              await moveTime(60 * 60);
+
+              // user2 (borrower) add new DAI collateral to increase HF
+              await mintAndapproveERC20(
+                user2,
+                DAI.target,
+                getAmountInWei(5000),
+                pool.target
+              );
+              await pool
+                .connect(user2)
+                .supply(DAI.target, getAmountInWei(5000), 0);
+
+              // user2 health factor is now above minimum
+              expect(
+                await pool.healthFactor(user2.address)
+              ).to.greaterThanOrEqual(getAmountInWei(1));
+
+              // move 1 hour in time
+              await moveTime(60 * 60);
+              // update oracle prices to avoid out of date price error
+              await nftFloorPriceFeed.updateAnswer(scaleAmount(10000, 8));
+              await wethFeed.updateAnswer(scaleAmount(2000, 8));
+              await daiFeed.updateAnswer(scaleAmount(1, 8));
+
+              // user3 tries to liquidate user2
+              await expect(
+                pool
+                  .connect(user3)
+                  .executeNFTLiquidation(
+                    user2.address,
+                    NFT.target,
+                    tokenId,
+                    [WETH.target],
+                    [getAmountInWei(4)]
+                  )
+              ).to.be.revertedWithCustomError(pool, "BorrowerIsSolvant");
+            });
+          });
         });
         describe("Getters functions", () => {
           describe("getUserData()", () => {

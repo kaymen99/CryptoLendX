@@ -7,6 +7,10 @@ import "./libraries/ChainlinkOracle.sol";
 import "./utils/Constants.sol";
 import "./interfaces/PoolStructs.sol";
 
+/**
+ * @title Lending Pool Token Support
+ * @dev used to add new supported ERC20 or ERC721 tokens to the lending pool, will give access to the chainlink USD price feeds.
+ */
 contract TokenSupport is Constants {
     using ChainlinkOracle for AggregatorV3Interface;
 
@@ -35,6 +39,12 @@ contract TokenSupport is Constants {
     //--------------------------------------------------------------------
     /** FUNCTIONS */
 
+    /**
+     * @dev Adds support for a new ERC20 or ERC721 token.
+     * @param token The address of the token.
+     * @param priceFeed The address of the Chainlink price feed.
+     * @param tokenType The type of the token (ERC20 or ERC721).
+     */
     function addSupportedToken(
         address token,
         address priceFeed,
@@ -56,6 +66,10 @@ contract TokenSupport is Constants {
         emit AddSupportedToken(token, tokenType);
     }
 
+    /**
+     * @dev Gets the USD price of a supported token using Chainlink Oracle.
+     * @param token The address of the token.
+     */
     function getTokenPrice(address token) public view returns (uint256 price) {
         if (!supportedTokens[token].supported) return 0;
         AggregatorV3Interface priceFeed = AggregatorV3Interface(
@@ -67,6 +81,10 @@ contract TokenSupport is Constants {
     //--------------------------------------------------------------------
     /** INTERNAL FUNCTIONS */
 
+    /**
+     * @dev Checks if a token is supported.
+     * @param token The address of the token.
+     */
     function allowedToken(address token) internal view {
         if (!supportedTokens[token].supported) revert TokenNotSupported();
     }
