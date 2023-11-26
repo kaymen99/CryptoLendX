@@ -28,6 +28,7 @@ let NFT, nftFloorPriceFeed;
 let vaultInfoParams = {
   reserveRatio: 20000, // 20%
   feeToProtocolRate: 1000, // 1%
+  flashFeeRate: 500, // 0.5%
   optimalUtilization: getAmountInWei(0.8), // 80%
   baseRate: 0,
   slope1: getAmountInWei(0.04), // 4%
@@ -1104,6 +1105,174 @@ let vaultInfoParams = {
                 );
             });
           });
+          describe("flashloan()", () => {
+            let flashLoanReceiver;
+            before(async () => {
+              // Deploy ERC20 and USD price feeds mocks
+              [DAI, WETH, WBTC, daiFeed, wethFeed, wbtcFeed] =
+                await deployTokenMocks();
+
+              // Deploy Lending Pool contract
+              pool = await deployPool(
+                DAI.target,
+                daiFeed.target,
+                vaultInfoParams
+              );
+
+              // unpause pool
+              await pool
+                .connect(owner)
+                .setPausedStatus(ethers.ZeroAddress, false);
+
+              // add supported ERC20 tokens
+              await setupTokenVault(
+                WETH.target,
+                wethFeed.target,
+                TokenType.ERC20,
+                vaultInfoParams,
+                true
+              );
+              await setupTokenVault(
+                WBTC.target,
+                wbtcFeed.target,
+                TokenType.ERC20,
+                vaultInfoParams,
+                true
+              );
+
+              // user 1 supplies WETH
+              await mintERC20(user1, WETH.target, getAmountInWei(80));
+              await supply(user1, WETH.target, getAmountInWei(80), pool);
+
+              // Deploy flashloan receiver mock
+              flashLoanReceiver = await ethers.deployContract(
+                "FlashloanReceiverMock",
+                [pool.target, WETH.target, WBTC.target]
+              );
+              await flashLoanReceiver.waitForDeployment();
+            });
+            it("should revert if input array is empty", async () => {
+              await expect(
+                pool
+                  .connect(user2)
+                  .flashloan(
+                    flashLoanReceiver.target,
+                    [],
+                    [getAmountInWei(20)],
+                    ethers.toUtf8Bytes("")
+                  )
+              ).to.be.revertedWithCustomError(pool, "EmptyArray");
+            });
+            it("should revert if mismatch in input arrays length", async () => {
+              await expect(
+                pool
+                  .connect(user2)
+                  .flashloan(
+                    flashLoanReceiver.target,
+                    [WETH.target],
+                    [getAmountInWei(20), getAmountInWei(10)],
+                    ethers.toUtf8Bytes("")
+                  )
+              ).to.be.revertedWithCustomError(pool, "ArrayMismatch");
+            });
+            it("should revert if user does not pay flashfee", async () => {
+              await expect(
+                pool
+                  .connect(user2)
+                  .flashloan(
+                    flashLoanReceiver.target,
+                    [WETH.target],
+                    [getAmountInWei(20)],
+                    ethers.toUtf8Bytes("")
+                  )
+              ).to.be.revertedWith("ERC20: transfer amount exceeds balance");
+            });
+            let beforePoolWETHBalance, beforePoolWETHAmount, feeAmountsPaid;
+            it("should allow user to flashloan tokens from the pool", async () => {
+              beforePoolWETHBalance = await WETH.balanceOf(pool.target);
+              const vault = await pool.getTokenVault(WETH.target);
+              beforePoolWETHAmount = vault.totalAsset.amount;
+
+              // mint receiver some WETH to pay fees
+              const erc20 = await ethers.getContractAt(
+                "ERC20DecimalsMock",
+                WETH.target
+              );
+              const mint_tx = await erc20.mint(
+                flashLoanReceiver.target,
+                getAmountInWei(1)
+              );
+              await mint_tx.wait(1);
+
+              pool.on(
+                "FlashloanSuccess",
+                (initiator, tokens, amounts, fees, data) => {
+                  expect(initiator).to.equal(user2.address);
+                  expect(tokens[0]).to.equal(WETH.target);
+                  expect(amounts[0]).to.equal(getAmountInWei(20));
+                  feeAmountsPaid = fees[0];
+                }
+              );
+
+              await expect(
+                pool
+                  .connect(user2)
+                  .flashloan(
+                    flashLoanReceiver.target,
+                    [WETH.target],
+                    [getAmountInWei(20)],
+                    ethers.toUtf8Bytes("")
+                  )
+              ).to.emit(pool, "FlashloanSuccess");
+            });
+            it("should transfer flash fee amount to pool", async () => {
+              expect(await WETH.balanceOf(pool.target)).to.equal(
+                beforePoolWETHBalance + feeAmountsPaid
+              );
+            });
+            it("should add flash fee amount to the tokens vaults", async () => {
+              const vault = await pool.getTokenVault(WETH.target);
+              expect(vault.totalAsset.amount).to.equal(
+                beforePoolWETHAmount + feeAmountsPaid
+              );
+            });
+            it("should revert if flashloaned token vault is paused", async () => {
+              // Pause WETH token vault
+              await pool.connect(owner).setPausedStatus(WETH.target, true);
+
+              await expect(
+                pool
+                  .connect(user2)
+                  .flashloan(
+                    flashLoanReceiver.target,
+                    [WETH.target],
+                    [getAmountInWei(20)],
+                    ethers.toUtf8Bytes("")
+                  )
+              ).to.be.revertedWithCustomError(pool, "FlashloanPaused");
+
+              // unpause WETH token vault
+              await pool.connect(owner).setPausedStatus(WETH.target, false);
+            });
+            it("should revert if flashloan receiver returns false", async () => {
+              // Deploy bad flashloan receiver mock
+              flashLoanReceiver = await ethers.deployContract(
+                "BadFlashloanReceiverMock",
+                [pool.target, WETH.target, WBTC.target]
+              );
+              await flashLoanReceiver.waitForDeployment();
+              await expect(
+                pool
+                  .connect(user2)
+                  .flashloan(
+                    flashLoanReceiver.target,
+                    [WETH.target],
+                    [getAmountInWei(20)],
+                    ethers.toUtf8Bytes("")
+                  )
+              ).to.be.revertedWithCustomError(pool, "FlashloanFailed");
+            });
+          });
         });
         describe("NFT Collateral Logic functions", () => {
           describe("depositNFT()", () => {
@@ -1883,6 +2052,122 @@ let vaultInfoParams = {
                     [getAmountInWei(4)]
                   )
               ).to.be.revertedWithCustomError(pool, "BorrowerIsSolvant");
+            });
+          });
+          describe("flashAirdrop()", () => {
+            let flashAirdropReceiver;
+            let tokenId = 1;
+            before(async () => {
+              // Deploy ERC20 and USD price feeds mocks
+              [DAI, WETH, WBTC, daiFeed, wethFeed, wbtcFeed] =
+                await deployTokenMocks();
+
+              // Deploy NFT mock and NFT floor price feeds mock
+              [NFT, nftFloorPriceFeed] = await deployNFTMocks();
+
+              // Deploy Lending Pool contract
+              pool = await deployPool(
+                DAI.target,
+                daiFeed.target,
+                vaultInfoParams
+              );
+
+              // add NFT to supported collateral
+              await setupTokenVault(
+                NFT.target,
+                nftFloorPriceFeed.target,
+                TokenType.ERC721,
+                vaultInfoParams,
+                true
+              );
+
+              // unpause pool
+              await pool
+                .connect(owner)
+                .setPausedStatus(ethers.ZeroAddress, false);
+
+              // user 1 mints NFT & deposit to pool
+              await mintAndapproveNFT(user1, NFT.target, tokenId, pool.target);
+              await pool.connect(user1).depositNFT(NFT.target, tokenId);
+
+              // Deploy flashAirdrop receiver mock
+              flashAirdropReceiver = await ethers.deployContract(
+                "FlashAirdropReceiverMock",
+                [pool.target, NFT.target]
+              );
+              await flashAirdropReceiver.waitForDeployment();
+            });
+            it("should revert if input tokenIds array is empty", async () => {
+              await expect(
+                pool
+                  .connect(user1)
+                  .flashAirdrop(
+                    flashAirdropReceiver.target,
+                    NFT.target,
+                    [],
+                    ethers.toUtf8Bytes("")
+                  )
+              ).to.be.revertedWithCustomError(pool, "EmptyArray");
+            });
+            it("should allow user to flash NFT to claim Airdrop", async () => {
+              pool.on("FlashloanSuccess", (initiator, nft, tokenIds, data) => {
+                expect(initiator).to.be.equal(user1.address);
+                expect(nft).to.be.equal(NFT.target);
+                expect(tokenIds[0]).to.be.equal(tokenId);
+              });
+
+              await expect(
+                pool
+                  .connect(user1)
+                  .flashAirdrop(
+                    flashAirdropReceiver.target,
+                    NFT.target,
+                    [tokenId],
+                    ethers.toUtf8Bytes("")
+                  )
+              ).to.emit(pool, "FlashAirdropSuccess");
+
+              // NFT must be returned to pool
+              expect(await NFT.ownerOf(tokenId)).to.be.equal(pool.target);
+            });
+            it("should revert if user did not deposit NFT", async () => {
+              // user 2 mints NFT 2
+              tokenId = 2;
+              await mintAndapproveNFT(user2, NFT.target, tokenId, pool.target);
+
+              await expect(
+                pool
+                  .connect(user2)
+                  .flashAirdrop(
+                    flashAirdropReceiver.target,
+                    NFT.target,
+                    [tokenId],
+                    ethers.toUtf8Bytes("")
+                  )
+              ).to.be.revertedWithCustomError(pool, "InvalidNFT");
+            });
+            it("should revert if flashAirdrop receiver returns false", async () => {
+              // Deploy bad flashAirdrop receiver mock
+              flashAirdropReceiver = await ethers.deployContract(
+                "BadFlashAirdropReceiverMock",
+                [pool.target, NFT.target]
+              );
+              await flashAirdropReceiver.waitForDeployment();
+
+              // user 2 deposit NFT 2
+              tokenId = 2;
+              await pool.connect(user2).depositNFT(NFT.target, tokenId);
+
+              await expect(
+                pool
+                  .connect(user2)
+                  .flashAirdrop(
+                    flashAirdropReceiver.target,
+                    NFT.target,
+                    [tokenId],
+                    ethers.toUtf8Bytes("")
+                  )
+              ).to.be.revertedWithCustomError(pool, "FlashAirdropFailed");
             });
           });
         });

@@ -2,11 +2,15 @@
 
 pragma solidity ^0.8.18;
 
+import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import {NFTCollateral} from "./NFTCollateral.sol";
 import {VaultAccounting} from "./libraries/VaultAccounting.sol";
+import {PoolStructs} from "./interfaces/PoolStructs.sol";
+import {IFlashLoanReceiver} from "./interfaces/IFlashLoanReceiver.sol";
+import {IFlashAirdropReceiver} from "./interfaces/IFlashAirdropReceiver.sol";
+import {InterestRate} from "./libraries/InterestRate.sol";
+import {Pausable} from "./utils/Pausable.sol";
 import "./libraries/TokenHelper.sol";
-import "./libraries/InterestRate.sol";
-import "./utils/Pausable.sol";
 
 /**
  * @title An NFT & ERC20 lending pool
@@ -44,8 +48,11 @@ contract LendingPool is Pausable, NFTCollateral {
         address nftAddress,
         uint256 tokenId
     );
-    error InvalidFeeAmount(uint256 fee);
+    error InvalidFeeRate(uint256 fee);
     error InvalidReserveRatio(uint256 ratio);
+    error FlashloanPaused(address token);
+    error FlashloanFailed();
+    error FlashAirdropFailed();
     error NoLiquidateWarn();
     error WarningDelayHasNotPassed();
     error MustRepayMoreDebt();
@@ -73,6 +80,19 @@ contract LendingPool is Pausable, NFTCollateral {
         uint256 interestEarned,
         uint256 feesAmount,
         uint256 feesShare
+    );
+    event FlashloanSuccess(
+        address initiator,
+        address[] tokens,
+        uint256[] amounts,
+        uint256[] fees,
+        bytes data
+    );
+    event FlashAirdropSuccess(
+        address initiator,
+        address nft,
+        uint256[] tokenIds,
+        bytes data
     );
     event DepositNFT(address user, address nftAddress, uint256 tokenId);
     event WithdrawNFT(
@@ -363,6 +383,53 @@ contract LendingPool is Pausable, NFTCollateral {
     }
 
     /**
+     * @notice Allow users to flashloan supported tokens.
+     * @dev must pay flashloan fees to this contract.
+     * @param receiverAddress address that receive flashloaned tokens amounts.
+     * @param tokens array of tokens addresses to be borrowed.
+     * @param amounts array of tokens amounts to be borrowed.
+     * @param data contain user-defined parameters.
+     */
+    function flashloan(
+        address receiverAddress,
+        address[] calldata tokens,
+        uint256[] calldata amounts,
+        bytes calldata data
+    ) external {
+        if (tokens.length == 0) revert EmptyArray();
+        if (tokens.length != amounts.length) revert ArrayMismatch();
+
+        IFlashLoanReceiver receiver = IFlashLoanReceiver(receiverAddress);
+        uint256[] memory fees = new uint256[](tokens.length);
+        for (uint256 i; i < tokens.length; ) {
+            if (maxFlashLoan(tokens[i]) == 0) revert FlashloanPaused(tokens[i]);
+            fees[i] = flashFee(tokens[i], amounts[i]);
+            tokens[i].transferERC20(address(this), receiverAddress, amounts[i]);
+            unchecked {
+                ++i;
+            }
+        }
+        if (!receiver.onFlashLoan(msg.sender, tokens, amounts, fees, data))
+            revert FlashloanFailed();
+
+        uint256 amountPlusFee;
+        for (uint256 i; i < tokens.length; ) {
+            amountPlusFee = amounts[i] + fees[i];
+            tokens[i].transferERC20(
+                receiverAddress,
+                address(this),
+                amountPlusFee
+            );
+            vaults[tokens[i]].totalAsset.amount += uint128(fees[i]);
+            unchecked {
+                ++i;
+            }
+        }
+
+        emit FlashloanSuccess(msg.sender, tokens, amounts, fees, data);
+    }
+
+    /**
      * @notice Accrue interest for a specific ERC20 token.
      * @param token The ERC20 token address.
      * @return _interestEarned The interest earned.
@@ -563,6 +630,49 @@ contract LendingPool is Pausable, NFTCollateral {
             totalRepaidDebtValue,
             nftBuyPrice
         );
+    }
+
+    /**
+     * @notice Allow NFT depositor to flashloan NFT to claim airdrop.
+     * @param receiverAddress address that receive flashloaned tokens amounts.
+     * @param nftAddress address of the NFT collection.
+     * @param tokenIds array of tokens Ids to be flashloaned.
+     * @param data contain user-defined parameters.
+     */
+    function flashAirdrop(
+        address receiverAddress,
+        address nftAddress,
+        uint256[] calldata tokenIds,
+        bytes calldata data
+    ) external {
+        if (tokenIds.length == 0) revert EmptyArray();
+        IFlashAirdropReceiver receiver = IFlashAirdropReceiver(receiverAddress);
+        for (uint256 i; i < tokenIds.length; ) {
+            if (!hasDepositedNFT(msg.sender, nftAddress, tokenIds[i]))
+                revert InvalidNFT();
+            IERC721(nftAddress).safeTransferFrom(
+                address(this),
+                receiverAddress,
+                tokenIds[i]
+            );
+            unchecked {
+                ++i;
+            }
+        }
+        if (!receiver.onFlashLoan(msg.sender, nftAddress, tokenIds, data))
+            revert FlashAirdropFailed();
+
+        for (uint256 i; i < tokenIds.length; ) {
+            IERC721(nftAddress).safeTransferFrom(
+                receiverAddress,
+                address(this),
+                tokenIds[i]
+            );
+            unchecked {
+                ++i;
+            }
+        }
+        emit FlashAirdropSuccess(msg.sender, nftAddress, tokenIds, data);
     }
 
     /**
@@ -803,6 +913,30 @@ contract LendingPool is Pausable, NFTCollateral {
         }
     }
 
+    /**
+     * @dev The amount of token available to be lended.
+     * @param token The loan currency.
+     * @return maxFlashloanAmount The amount of `token` that can be borrowed.
+     */
+    function maxFlashLoan(
+        address token
+    ) public view returns (uint256 maxFlashloanAmount) {
+        maxFlashloanAmount = pausedStatus(token) ? 0 : type(uint256).max;
+    }
+
+    /**
+     * @dev The fee to be charged for a given token loan.
+     * @param token The loan token.
+     * @param amount The amount of tokens lent.
+     * @return The fee amount of `token` to be charged for the loan, on top of the returned principal.
+     */
+    function flashFee(
+        address token,
+        uint256 amount
+    ) public view returns (uint256) {
+        return (amount * vaults[token].vaultInfo.flashFeeRate) / BPS;
+    }
+
     /*//////////////////////////////////////////////////////////////
                             Owner functions
     //////////////////////////////////////////////////////////////*/
@@ -978,10 +1112,13 @@ contract LendingPool is Pausable, NFTCollateral {
             if (params.reserveRatio > BPS)
                 revert InvalidReserveRatio(params.reserveRatio);
             if (params.feeToProtocolRate > MAX_PROTOCOL_FEE)
-                revert InvalidFeeAmount(params.feeToProtocolRate);
+                revert InvalidFeeRate(params.feeToProtocolRate);
+            if (params.flashFeeRate > MAX_PROTOCOL_FEE)
+                revert InvalidFeeRate(params.flashFeeRate);
             PoolStructs.VaultInfo storage _vaultInfo = vaults[token].vaultInfo;
             _vaultInfo.reserveRatio = params.reserveRatio;
             _vaultInfo.feeToProtocolRate = params.feeToProtocolRate;
+            _vaultInfo.flashFeeRate = params.flashFeeRate;
             _vaultInfo.optimalUtilization = params.optimalUtilization;
             _vaultInfo.baseRate = params.baseRate;
             _vaultInfo.slope1 = params.slope1;

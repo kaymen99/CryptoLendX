@@ -38,6 +38,7 @@ interface PoolStructs {
     struct VaultInfo {
         uint64 reserveRatio;
         uint64 feeToProtocolRate;
+        uint64 flashFeeRate;
         uint64 ratePerSec;
         uint64 lastBlock;
         uint64 lastTimestamp;
@@ -50,6 +51,7 @@ interface PoolStructs {
     struct VaultSetupParams {
         uint64 reserveRatio;
         uint64 feeToProtocolRate;
+        uint64 flashFeeRate;
         uint64 baseRate;
         uint64 slope1;
         uint64 slope2;
