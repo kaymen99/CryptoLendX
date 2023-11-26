@@ -51,7 +51,7 @@ contract TokenSupport is Constants {
         PoolStructs.TokenType tokenType
     ) internal {
         if (supportedTokens[token].supported) revert AlreadySupported(token);
-        if (uint256(tokenType) > 2) revert InvalidTokenType(tokenType);
+        if (uint256(tokenType) > 1) revert InvalidTokenType(tokenType);
 
         supportedTokens[token].usdPriceFeed = priceFeed;
         supportedTokens[token].tokenType = tokenType;
