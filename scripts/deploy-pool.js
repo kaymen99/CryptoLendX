@@ -8,6 +8,7 @@ const daiPriceFeed = "0x0FCAa9c899EC5A91eBc3D5Dd869De833b06fB046";
 const daiVaultParams = {
   reserveRatio: 20000, // 20%
   feeToProtocolRate: 1000, // 1%
+  flashFeeRate: 500, // 0.5%
   optimalUtilization: getAmountInWei(0.8), // 80%
   baseRate: 0,
   slope1: getAmountInWei(0.04), // 4%
