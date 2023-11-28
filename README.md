@@ -20,42 +20,45 @@ This is a decentralized lending and borrowing protocol built from scratch, inspi
 
 * **Asset Price Oracle**: Asset prices in USD are determined using the Chainlink oracle price feeds, for ERC20 tokens the normal market prices are fetched from the oracle but for the NFTs we will fetch the collection floor price.
 
-## Future developments
-
-* Introducing flashloan functionality to the lending pool.
-  
-* Enabling users to utilize NFTs (ERC721) as collateral and borrow against them.
-
 ## Getting Started
 
-Steps to run the tests: (Hardhat version 2.9.9)
+Steps to run the tests: (Hardhat version 2.19.0)
 
 ### Clone this repo
 
-> git clone https://github.com/kaymen99/Defi-Lending.git
+```shell
+git clone https://github.com/kaymen99/CryptoLendX
+```
 
 ### Installs all of the files
 
-> yarn install
+```shell
+yarn install
+```
 
-### Required for tests and all other actions to work  
+### Setup environment variables for real/test networks 
 
 > Create .env file with env var PRIVATE_KEY= , POLYGON_RPC_URL= , POLYGONSCAN_API_KEY= (use http://alchemy.com)
 
 ### Compiles all of the contracts
 
-> yarn compile
+```shell
+yarn compile
+```
 
 ### Deploy lending pool
-
-> yarn deploy --network-name
+```shell
+yarn deploy --<network-name>
+```
 
 ### Runs all of the tests
 
-> yarn test
+```shell
+yarn test
+```
 
 ### Displays the coverage of the contracts
 
-> yarn coverage
-
-
+```shell
+yarn coverage
+```
